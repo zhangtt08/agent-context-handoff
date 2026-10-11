@@ -7,6 +7,7 @@ import {
   findProject, listProjects, loadHandoffRecords, getHandoffRecord,
 } from "./store.js";
 import { gitStatus, isGitRepo, isExcluded, excludePolicySummary } from "./gitutil.js";
+import path from "node:path";
 import { verifyPackage } from "./package.js";
 import type { HandoffRecord, ProjectConfig } from "../../shared/types.js";
 
@@ -23,6 +24,9 @@ export class OverviewNotFound extends Error {}
  * 报 500 会让 Agent 以为服务有问题去重试。
  */
 export class ProjectDirUnavailable extends OverviewNotFound {}
+
+/** 本机封存存储里找不到这条交接 */
+export class HandoffNotFound extends Error {}
 
 /**
  * REST 总览、REST 预览、Agent 工具共用的那一道目录检查（只有一份）。
@@ -69,14 +73,6 @@ export function detectForks(records: Records) {
   return forks;
 }
 
-export function latestPublication(r: HandoffRecord) {
-  const pub = r.publications[r.publications.length - 1];
-  if (!pub) return { label: "未发布", tone: "" };
-  if (pub.state === "已发布") return { label: pub.target === "github" ? `已发布 · ${pub.location.split("·").pop()?.trim()}` : `本地导出`, tone: "green" };
-  if (pub.state === "失败") return { label: `发布失败`, tone: "red" };
-  return { label: pub.state, tone: "" };
-}
-
 export function verifySummary(r: HandoffRecord) {
   const vs = r.state.verifications;
   if (vs.length === 0) return { label: "未执行", tone: "" };
@@ -85,7 +81,7 @@ export function verifySummary(r: HandoffRecord) {
   return { label: "检查通过", tone: "green" };
 }
 
-/** 总览页数据；项目未注册或目录已不是 Git 仓库时抛错（由调用方折成 HTTP/Agent 错误） */
+/** 首页状态条数据；项目未注册或目录已不是 Git 仓库时抛错（由调用方折成 HTTP/Agent 错误） */
 export async function buildProjectOverview(projectIdOrPath: string) {
   const p = await requireGitProject(projectIdOrPath);
 
@@ -110,7 +106,6 @@ export async function buildProjectOverview(projectIdOrPath: string) {
     stats: {
       changes: realEntries.length,
       activeTasks: tasks.filter((t) => t.status === "进行中").length,
-      published: records.filter((r) => r.publications.some((x) => x.state === "已发布")).length,
       forks: forks.length,
       failedChecks: records.filter((r) => r.state.verifications.some((v) => v.result !== "通过" && v.result !== "未执行")).length,
     },
@@ -120,9 +115,8 @@ export async function buildProjectOverview(projectIdOrPath: string) {
       taskName: r.state.taskName,
       sealedAt: r.sealedAt,
       snapshot: `${r.state.baseline.commit?.slice(0, 7) ?? "无"} + ${r.state.changes.length} 文件`,
-      publish: latestPublication(r),
       verify: verifySummary(r),
-      integrity: { label: "未核对", tone: "" },
+      briefPath: path.join(r.packageDir, "HANDOFF.md"),
     })),
     forksList: forks,
   };
@@ -141,7 +135,7 @@ export async function locateHandoff(handoffId: string): Promise<{ project: Proje
   return null;
 }
 
-/** 包完整性实测（打开详情页/工具调用时才跑，避免总览页逐包扫盘） */
+/** 包完整性实测（展开交接档案 / 工具调用时才跑，避免首页逐包扫盘） */
 export async function measureIntegrity(rec: HandoffRecord) {
   const c = await verifyPackage(rec.packageDir);
   return {

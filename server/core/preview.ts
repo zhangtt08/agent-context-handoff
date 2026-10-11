@@ -1,6 +1,8 @@
 // Preview Module：把"将要打包什么、排除了什么、为什么"在动手之前摊开给人看。
-// 只做磁盘探测（plan），不读文件内容、不写任何文件，因此可以在大仓库上反复刷新。
+// 主体只做磁盘探测（plan），因此可以在大仓库上反复刷新；
+// 唯一额外的读取来自推断（未跟踪文件头部 64KB/个 + 一次 git diff），用于替人写出任务与进度。
 import { plan, CAPTURE_MEMORY_LIMIT } from "./capture.js";
+import { inferIntent } from "./infer.js";
 import {
   caseCollisions, fmtBytes, isExcluded, isSafeRelPath, windowsNameIssues,
   projectedPathLength, WIN_MAX_PATH,
@@ -49,7 +51,7 @@ export function pathFidelityAlerts(paths: string[], baseDir?: string): PreviewAl
       level: "警告",
       title: `${named.length} 个路径在 Windows 上不可命名：${named.slice(0, LIST_CAP).map((p) => `${p}（${windowsNameIssues(p)[0]}）`).join("、")}${named.length > LIST_CAP ? " 等" : ""}`,
       detail: "Windows 把 CON/NUL/COM1 之类名字保留给设备，也不接受以点或空格结尾的段。ACB 用扩展长度路径仍能按字节写出，但资源管理器与多数工具看不见、打不开，删除也要特殊手段。",
-      action: "接收端包含 Windows 就先在源仓库改名；确认只交给 Linux/macOS 可以继续。",
+      action: "先在仓库里改掉这些名字；确认接手方不在 Windows 上就可以继续。",
     });
   }
 
@@ -85,6 +87,8 @@ export function pathFidelityBlockerMessage(paths: string[]): string | null {
 
 export async function buildPreview(cfg: ProjectConfig): Promise<CapturePreview> {
   const p0 = await plan(cfg.path);
+  // 推断要在告警之前拿到：ACB 自己写进项目的那段接入块，正是由它逐行认出来的
+  const inferred = await inferIntent(cfg.path, p0.status, p0.baselinePaths);
 
   const included: PreviewFile[] = p0.files.map((f) => ({
     path: f.path, bytes: f.bytes, status: f.status, mode: f.mode, staged: f.staged, kind: f.kind,
@@ -103,7 +107,18 @@ export async function buildPreview(cfg: ProjectConfig): Promise<CapturePreview> 
     });
   }
 
-  // 2. 路径形态：改动 + 基线树一起判（基线里的中文名/仅大小写不同同样会在接收端互相覆盖或落不了地）
+  // 1.5 ACB 自己写进项目的东西要说清是谁改的：接入块会让 AGENTS.md 出现在改动清单里，
+  // 不点明的话它会伪装成"你今天写的代码"。判据来自 inferIntent 的逐行比对，不在这里再跑一次 git。
+  if (inferred.acbOwnEdits.length) {
+    alerts.push({
+      level: "提示",
+      title: `${inferred.acbOwnEdits.length} 个文件的改动是 ACB 自己写的，不是你的`,
+      detail: `${inferred.acbOwnEdits.join("、")} 里只有 ACB 那段接入块（让项目里的 Agent 自己读到该接手什么、怎么自己封存）。这次它仍会照常进包 —— 还原出来的目录同样需要这一段。`,
+      action: "不想让 ACB 再动这个文件：删掉 AGENTS.md 里 ACB:BEGIN 与 ACB:END 标记之间的内容，再在项目根建一个空文件 .acb/NO-BRIDGE。",
+    });
+  }
+
+  // 2. 路径形态：改动 + 基线树一起判（基线里的中文名/仅大小写不同同样会在还原时互相覆盖或落不了地）
   alerts.push(...pathFidelityAlerts(fidelityScopePaths(included.map((f) => f.path), p0.baselinePaths), cfg.path));
 
   // 3. 已提交进历史的凭据：排除策略只挡工作区改动，挡不住 bundle 携带的历史
@@ -112,7 +127,7 @@ export async function buildPreview(cfg: ProjectConfig): Promise<CapturePreview> 
       level: "警告",
       title: `${p0.baselineSecrets.length} 个凭据文件已在 Git 历史中`,
       detail: `${p0.baselineSecrets.slice(0, LIST_CAP).join("、")}${p0.baselineSecrets.length > LIST_CAP ? " 等" : ""} 已被提交。基线 bundle 随包携带完整历史，纳入策略无法阻止历史里的内容离开这台电脑。`,
-      action: "要跨机交接就先确认这些是测试夹具；若是真凭据，请改用只含本机的历史清理（git filter-repo / BFG）或换用只带所需的仓库，并在接收端轮换该凭据。",
+      action: "先确认这些是不是测试夹具；若是真凭据，本项目的历史需要单独清理（git filter-repo / BFG），并在用到它的地方轮换该凭据。",
     });
   }
 
@@ -123,7 +138,7 @@ export async function buildPreview(cfg: ProjectConfig): Promise<CapturePreview> 
       level: "警告",
       title: `已默认排除 ${secretExcluded.length} 个凭据/配置文件`,
       detail: secretExcluded.map((e) => `${e.path}（${e.reason}）`).join("；"),
-      action: "这些文件会写进「恢复要求」，接收端需在本机自行补齐后再运行；不要为了让另一台电脑能跑而把它们放进包。",
+      action: "这些文件会写进「恢复要求」，谁接手谁在本机自己补一份；不要因为程序跑不起来就把密钥放进交接包。",
     });
   }
 
@@ -134,7 +149,7 @@ export async function buildPreview(cfg: ProjectConfig): Promise<CapturePreview> 
       level: "警告",
       title: `${unreadable.length} 个路径读不到内容`,
       detail: `${unreadable.map((f) => f.path).slice(0, LIST_CAP).join("、")}${unreadable.length > LIST_CAP ? " 等" : ""} 在工作区里被 git 报为改动，但内容取不到（常见于指向不存在目标的符号链接）。`,
-      action: "接收端不会凭空出现这些文件。先修复链接目标或删掉它们，再创建交接。",
+      action: "还原出来的目录里不会凭空出现这些文件。先修复链接目标或删掉它们，再创建交接。",
     });
   }
 
@@ -143,8 +158,8 @@ export async function buildPreview(cfg: ProjectConfig): Promise<CapturePreview> 
     alerts.push({
       level: "警告",
       title: `仓库对象约 ${fmtBytes(p0.repoBytes)}，打包会明显偏慢`,
-      detail: "为了让接收端不必再克隆原仓库，交接包用 git bundle 携带完整历史；历史越大，封存与导出越久，交接文件也越大。",
-      action: "首次交接后，第二台电脑直接 git clone 原仓库再接收交接包会快得多；或用 git shallow/过滤历史瘦身。",
+      detail: "为了让接手方不必再克隆原仓库，交接包用 git bundle 携带完整历史；历史越大，封存越久，包也越大。",
+      action: "封存慢是因为要把完整历史一起写进 bundle，不是包出了问题。想提速：先提交再交接（改动走基线，历史仍要带一次），或给仓库瘦身（git shallow / 过滤历史）。",
     });
   }
 
@@ -155,7 +170,7 @@ export async function buildPreview(cfg: ProjectConfig): Promise<CapturePreview> 
       level: "警告",
       title: `改动内容约 ${fmtBytes(pendingBytes)}，需要整体读进内存`,
       detail: `单次捕获的内存上限是 ${fmtBytes(CAPTURE_MEMORY_LIMIT)}，超过就会被拦下（不会半途把机器读到卡死）。通常是二进制或生成物混进了改动范围。`,
-      action: "把可再生产物加进 .gitignore，或改用「发布到 GitHub 交接分支」——那条路径按 git 对象传输，不需要整体驻留内存。",
+      action: "把可再生产物加进 .gitignore；确实要带的大文件先提交一次，让它走基线 bundle 而不是整体读进内存。",
     });
   }
 
@@ -175,7 +190,7 @@ export async function buildPreview(cfg: ProjectConfig): Promise<CapturePreview> 
     alerts.push({
       level: "提示",
       title: `${symlinks.length} 个符号链接按链接目标保存`,
-      detail: `与 Git 一致，符号链接存的是目标路径文本（${symlinks.slice(0, 4).map((f) => f.path).join("、")}${symlinks.length > 4 ? " 等" : ""}）。若目标是绝对路径或指向仓库外，接收端会悬空。`,
+      detail: `与 Git 一致，符号链接存的是目标路径文本（${symlinks.slice(0, 4).map((f) => f.path).join("、")}${symlinks.length > 4 ? " 等" : ""}）。若目标是绝对路径或指向仓库外，还原后会悬空。`,
       action: "恢复到 Windows 时若没有创建符号链接的权限，ACB 会先试无权限要求的目录联接，再退回写成普通文件并在报告里如实标注，届时请手动补链接。",
     });
   }
@@ -187,9 +202,9 @@ export async function buildPreview(cfg: ProjectConfig): Promise<CapturePreview> 
         ? `${p0.emptyDirs.length} 个空目录会一并重建`
         : "空目录扫描达到上限",
       detail: p0.emptyDirs.length
-        ? `Git 不保存空目录，所以它们既不在改动清单也不在基线树里：${p0.emptyDirs.slice(0, LIST_CAP).join("、")}${p0.emptyDirs.length > LIST_CAP ? " 等" : ""}。不单独带过去，接收端就缺这些目录（常见于 uploads/、logs/ 这类运行时占位）。`
+        ? `Git 不保存空目录，所以它们既不在改动清单也不在基线树里：${p0.emptyDirs.slice(0, LIST_CAP).join("、")}${p0.emptyDirs.length > LIST_CAP ? " 等" : ""}。不单独带过去，还原出来的目录就缺这些目录（常见于 uploads/、logs/ 这类运行时占位）。`
         : "空目录扫描在达到上限时被截断，本次没有列出可重建的空目录，可能仍有遗漏。",
-      action: "无需操作，恢复时会 mkdir 重建；若某目录里有被 .gitignore 掉的文件，那不属于空目录，需要接收端自行创建。",
+      action: "无需操作，恢复时会 mkdir 重建；若某目录里有被 .gitignore 掉的文件，那不属于空目录，需要接手方自己创建。",
     });
   }
 
@@ -213,6 +228,7 @@ export async function buildPreview(cfg: ProjectConfig): Promise<CapturePreview> 
     checksConfigured: cfg.checks.length,
     env: { os: process.platform, runtime: `node ${process.version}`, git: ">=2.20" },
     bundleNote: `基线 bundle 额外携带完整历史（约 ${fmtBytes(p0.repoBytes)} · ${p0.objects} 个对象）· 基线树 ${p0.baselinePaths.length} 个路径`,
+    inferred,
   };
 }
 

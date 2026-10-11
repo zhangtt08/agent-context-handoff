@@ -5,7 +5,7 @@ import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import {
-  GitStatus, gitStatus, id, isExcluded, exclusionInfo, sourceDigest, ensureDir,
+  GitStatus, gitStatus, id, isExcluded, exclusionInfo, collapseExcluded, sourceDigest, ensureDir,
   statSize, looksLikeSecret, repoSize, fmtBytes, isSafeRelPath, gitNul, DEFAULT_EXCLUDES,
 } from "./gitutil.js";
 import type { ExcludeReason, Observation } from "../../shared/types.js";
@@ -42,7 +42,7 @@ export interface CapturePlan {
   baselineSecrets: string[];
   repoBytes: number;
   objects: number;
-  /** 工作区里的空目录：Git 不跟踪它们，不单独带就会在另一台电脑上消失 */
+  /** 工作区里的空目录：Git 不跟踪它们，不单独带就会在还原出来的目录里消失 */
   emptyDirs: string[];
   /** 扫描是否触到上限被截断（大仓库不做无界递归，但必须如实说明） */
   scanTruncated: boolean;
@@ -98,7 +98,7 @@ function isPrunedDir(rel: string, ignored: Set<string>): boolean {
   return false;
 }
 
-/** 找出工作区里的空目录（Git 不保存它们，不显式带过去接收端就少一层目录） */
+/** 找出工作区里的空目录（Git 不保存它们，不显式带过去就少一层目录） */
 export async function findEmptyDirs(root: string): Promise<{ dirs: string[]; truncated: boolean }> {
   const ignored = await ignoredDirPrefixes(root);
   const dirs: string[] = [];
@@ -143,7 +143,7 @@ async function readEntryContent(abs: string, mode: string): Promise<Buffer | nul
 /**
  * Git 的 120000 blob 一律用正斜杠存链接目标；Windows 的 readlink 会把目标里的 / 变成 \。
  * 不归一化就会出现"同一份内容在 Windows 上复算出不同指纹"的假阴性，
- * 也会让接收端把反斜杠当目标写回去 —— 两个都是跨机还原的真坑。
+ * 也会让接收端把反斜杠当目标写回去 —— 两个都是异目录还原的真坑。
  */
 export function normalizeLink(target: string): string {
   return process.platform === "win32" ? target.replace(/\\/g, "/") : target;
@@ -185,7 +185,7 @@ export async function listTree(cwd: string, commit: string): Promise<string[]> {
 }
 
 /**
- * 只做磁盘探测，不读文件内容。顺带挡下几类跨机还原的坑：
+ * 只做磁盘探测，不读文件内容。顺带挡下几类异目录还原的坑：
  * 路径穿越（拼进 path.join 会写到目标目录外）、被误当文件内容的符号链接、
  * 已提交进历史因此排除策略挡不住的凭据文件、只在 Windows 上不可命名的路径。
  */
@@ -256,7 +256,7 @@ export async function plan(projectPath: string, onProgress?: Progress): Promise<
   const empties = await findEmptyDirs(projectPath);
 
   return {
-    status: st, files, excluded, baselinePaths, baselineSecrets,
+    status: st, files, excluded: collapseExcluded(excluded), baselinePaths, baselineSecrets,
     repoBytes: size.bytes, objects: size.objects,
     emptyDirs: empties.dirs, scanTruncated: empties.truncated,
   };
@@ -279,7 +279,7 @@ export async function capture(
       .map((f) => `${f.path} ${fmtBytes(f.bytes)}`).join("、");
     throw new Error(
       `纳入范围的改动内容约 ${fmtBytes(pendingBytes)}，超过单次捕获的内存上限 ${fmtBytes(CAPTURE_MEMORY_LIMIT)}（最大几项：${biggest}）。`
-      + "出路：把大文件从改动范围里拿掉（可再生产物加进 .gitignore），或走「发布到 GitHub 交接分支」——那条路径按 git 对象传输，不需要把内容整体读进内存。",
+      + "出路：把大文件从改动范围里拿掉（可再生产物加进 .gitignore），或先提交一次让它只留在基线 bundle 里。",
     );
   }
 
@@ -330,7 +330,7 @@ async function assemble(
     {
       source: "fs", scope: "空目录", at: takenAt,
       text: p0.emptyDirs.length
-        ? `${p0.emptyDirs.length} 个空目录单独记录并随包重建（${p0.emptyDirs.slice(0, 5).join("、")}${p0.emptyDirs.length > 5 ? " 等" : ""}）：Git 不保存空目录，不显式带过去它们在接收端不会出现`
+        ? `${p0.emptyDirs.length} 个空目录单独记录并随包重建（${p0.emptyDirs.slice(0, 5).join("、")}${p0.emptyDirs.length > 5 ? " 等" : ""}）：Git 不保存空目录，不显式带过去它们就不会出现`
         : "工作区没有空目录需要重建",
     },
   ];
@@ -340,13 +340,13 @@ async function assemble(
   if (p0.baselineSecrets.length) {
     observations.push({
       source: "git", scope: "凭据告警", at: takenAt,
-      text: `已提交进 Git 历史的凭据文件 ${p0.baselineSecrets.length} 个（${p0.baselineSecrets.slice(0, 5).join("、")}${p0.baselineSecrets.length > 5 ? " 等" : ""}）：纳入策略只挡工作区改动，基线 bundle 会连同历史一起带走，需要另行清理历史或在接收端替换`,
+      text: `已提交进 Git 历史的凭据文件 ${p0.baselineSecrets.length} 个（${p0.baselineSecrets.slice(0, 5).join("、")}${p0.baselineSecrets.length > 5 ? " 等" : ""}）：纳入策略只挡工作区改动，基线 bundle 会连同历史一起带走，需要另行清理历史或在接手方替换`,
     });
   }
   if (unreadable.length) {
     observations.push({
       source: "fs", scope: "缺失材料", at: takenAt,
-      text: `${unreadable.length} 个路径读不到内容（${unreadable.slice(0, 5).join("、")}${unreadable.length > 5 ? " 等" : ""}），通常是悬空符号链接；未纳入恢复材料，接收端不会凭空出现该文件`,
+      text: `${unreadable.length} 个路径读不到内容（${unreadable.slice(0, 5).join("、")}${unreadable.length > 5 ? " 等" : ""}），通常是悬空符号链接；未纳入恢复材料，还原后不会凭空出现该文件`,
     });
   }
 

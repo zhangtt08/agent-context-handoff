@@ -1,7 +1,7 @@
 {
   "name": "acb",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "concurrently -k \"tsx server/main.ts\" \"vite\"",
@@ -13,6 +13,7 @@
     "lint": "oxlint",
     "preview": "vite preview",
     "verify": "node scripts/verify-release.mjs",
+    "tokens": "tsx scripts/token-report.ts",
     "package": "bash scripts/pack-desktop.sh",
     "agent:serve": "tsx server/main.ts",
     "agent:mcp": "node agent/mcp-server.mjs",
@@ -22,16 +23,13 @@
     "express": "^5.2.1",
     "lucide-react": "^1.49.0",
     "react": "^19.2.8",
-    "react-dom": "^19.2.8",
-    "react-router-dom": "^7.18.4",
-    "tar": "^7.5.22"
+    "react-dom": "^19.2.8"
   },
   "devDependencies": {
     "@types/express": "^5.0.6",
     "@types/node": "^24.13.3",
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
-    "@types/tar": "^6.1.13",
     "@vitejs/plugin-react": "^6.1.1",
     "concurrently": "^10.0.5",
     "electron": "^44.5.1",

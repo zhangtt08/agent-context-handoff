@@ -1,7 +1,7 @@
 // 本机回环守卫：绑定地址 + Host/Origin 校验 + 可选本机令牌
 //
 // 为什么需要这一层（2026-10-05 验收判为 BLOCKER）：ACB 的 API 没有任何鉴权，而它最核心的
-// 能力之一就是执行「项目设置里配置的命令」（server/core/verify.ts 的 exec(c.cmd)）。
+// 能力之一就是执行「「换项目 / 管理」里配置的命令」（server/core/verify.ts 的 exec(c.cmd)）。
 // 一旦服务监听在非回环地址上，同一局域网里任何一台机器都能
 // PUT /api/projects/:id/config 写入 checks[].cmd，再 POST /api/projects/:id/handoffs 触发它
 // —— 那是一台无人值守的远程命令执行器。
@@ -49,7 +49,7 @@ export function resolveBindHost(env: NodeJS.ProcessEnv = process.env): string {
     `ACB_BIND_HOST="${raw}" 不是回环地址，ACB 拒绝以此启动。` +
     `原因：本服务的检查功能会执行项目里配置的命令，绑到非回环地址等于把远程命令执行开放给整个局域网。` +
     `出路：删掉 ACB_BIND_HOST（默认只监听 127.0.0.1），或改成 127.0.0.1 / ::1；` +
-    `要跨电脑交接请用「发布到 GitHub 交接分支」或「导出本地文件」，那不是开放 API。`,
+    `本产品只做本机 Agent 交接，不提供远程访问；要给别人看界面请让他自己在本机打开 ACB.exe。`,
   );
 }
 
@@ -170,7 +170,7 @@ export function localGuard(cfg: GuardConfig) {
         "forbidden_host",
         `Host 头「${req.headers.host ?? "(缺失)"}」不是本机回环地址（只接受 127.0.0.1${port ? `:${port}` : ""} / localhost / [::1]，端口可省略）。` +
         `这一条挡的是 DNS 重绑定：域名解析到 127.0.0.1 之后请求确实打在回环上，但它来自另一个源。` +
-        `出路：直接用 http://127.0.0.1:${port}/ 访问；要跨电脑交接请用「发布到 GitHub 交接分支」或「导出本地文件」。`,
+        `出路：用 http://127.0.0.1:${port}/ 或双击 ACB.exe 打开；本服务有意只绑回环，不做局域网共享。`,
       );
       return;
     }

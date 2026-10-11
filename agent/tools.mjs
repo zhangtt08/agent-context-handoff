@@ -48,9 +48,19 @@ function loadBuiltRegistry() {
 
 export function baseUrlCandidates() {
   const endpoint = path.join(__dirname, ".endpoint");
+  const home = process.env.ACB_HOME || os.homedir();
+  const discovered = (() => {
+    try {
+      const j = JSON.parse(readFileSync(path.join(home, ".acb", "endpoint.json"), "utf8"));
+      return typeof j.base_url === "string" ? j.base_url.trim() : null;
+    } catch {
+      return null;      // 打包版跑随机端口时这是唯一发现途径；读不到就退回下面的候选
+    }
+  })();
   return [
     process.env.AGENT_BASE_URL,
     existsSync(endpoint) ? readFileSync(endpoint, "utf8").trim() : null,
+    discovered,
     DEFAULT_BASE,
   ].filter(Boolean);
 }
@@ -259,8 +269,7 @@ async function main(argv) {
       "acb.handoff_preview": projectId ? { projectId } : null,
       "acb.handoff_detail": handoffId ? { handoffId } : null,
       "acb.handoff_integrity": handoffId ? { handoffId } : null,
-      "acb.handoff_preview_resume": handoffId && projectId ? { mode: "remote", projectId, handoffId, targetDir } : null,
-      "acb.remote_handoffs": null,
+      "acb.handoff_preview_resume": handoffId && projectId ? { projectId, handoffId, targetDir } : null,
       "acb.job_status": null,
     };
     let failed = 0;

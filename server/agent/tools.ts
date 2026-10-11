@@ -2,7 +2,7 @@
  * ACB Agent 能力注册表（契约：personal-agent-hub/docs/AGENT_API_STANDARD.md v1）。
  *
  * 三条硬规矩（改这里之前先读）：
- *  1. 每个 handler 调的都是本项目**已有的核心模块**（store / workflow / transport / resume /
+ *  1. 每个 handler 调的都是本项目**已有的核心模块**（store / workflow / resume /
  *     verify / preview / package），与网页按同一个按钮走同一条代码路径。绝不在这里返回写死的
  *     样例数据 —— Agent 读到的数字必须和用户在界面上看到的是同一份。
  *  2. `input_schema` 就是公布出去的契约，schema.ts 的校验器直接读它（单一来源，不会漂移）。
@@ -10,21 +10,24 @@
  *     统一拒绝（executeAgentTool 里判一次），不指望每个 handler 自己记得。
  *
  * 只读面优先；写/exec 面只在"确实有用且明确设了闸门"的地方开：
- * 注册项目、封存交接、发布、恢复、移除注册。删除真实数据（包目录、目标工作区）不暴露为工具。
+ * 注册项目、封存交接、恢复、移除注册。删除真实数据（包目录、目标工作区）不暴露为工具。
  */
+import path from "node:path";
 import {
   listProjects, removeProject, findProject, loadHandoffRecords,
   loadResumeReports, storageNotices, registryPath, reportsPath,
 } from "../core/store.js";
 import { createHandoff } from "../core/workflow.js";
-import { publishHandoff, HandoffNotFound } from "../core/publish.js";
 import { previewResume, performResume, type ResumeRequest } from "../core/resume-flow.js";
 import { buildPreview } from "../core/preview.js";
-import { listRemoteHandoffs, fetchRemoteMeta } from "../core/transport.js";
+import { takeover, TakeoverAmbiguous, TakeoverNotFound } from "../core/takeover.js";
 import { getJob } from "../core/jobs.js";
-import { buildProjectOverview, locateHandoff, measureIntegrity, requireGitProject, OverviewNotFound } from "../core/overview.js";
+import {
+  buildProjectOverview, locateHandoff, measureIntegrity, requireGitProject,
+  OverviewNotFound, HandoffNotFound,
+} from "../core/overview.js";
 import { registerProjectDir, saveProjectConfig, ProjectNotRegistered, type ConfigPatch } from "../core/registry.js";
-import { assertSafeGitRemote, UnsafeGitArgumentError } from "../core/remote-policy.js";
+import { UnsafeArgumentError } from "../core/arg-guard.js";
 import { isGitRepo } from "../core/gitutil.js";
 import { resolveBindHost } from "../core/local-guard.js";
 import { AgentError } from "./errors.js";
@@ -122,7 +125,6 @@ async function projectsListHandler() {
     path: p.path,
     dirAvailable: await isGitRepo(p.path),
     checksConfigured: p.checks?.length ?? 0,
-    githubRemoteConfigured: Boolean(p.githubRemote),
   })));
   return {
     count: probed.length,
@@ -148,7 +150,7 @@ async function handoffsListHandler(input: Record<string, unknown>) {
     sealedAt: r.sealedAt,
     changes: r.state.changes.length,
     sourceDigest: r.state.sourceDigest,
-    publish: r.publications.length ? r.publications[r.publications.length - 1].state : "未发布",
+    briefPath: path.join(r.packageDir, "HANDOFF.md"),
     verifications: r.state.verifications.length,
     parentHandoffIds: r.state.parentHandoffIds,
   }));
@@ -158,7 +160,7 @@ async function handoffsListHandler(input: Record<string, unknown>) {
 
 async function handoffDetailHandler(input: Record<string, unknown>) {
   const located = await locateHandoff(reqStr(input, "handoffId"));
-  if (!located) throw new AgentError("not_found", `交接不存在：${input.handoffId}`, "跨电脑请用交接文件或 GitHub 交接分支恢复；本机用 acb.handoffs_list 看有哪些");
+  if (!located) throw new AgentError("not_found", `交接不存在：${input.handoffId}`, "用 acb.handoffs_list 看本机注册项目各封存了哪些交接");
   const { record: r, project, children } = located;
   const s = r.state;
   return {
@@ -175,10 +177,10 @@ async function handoffDetailHandler(input: Record<string, unknown>) {
     recoveryRequirements: s.recoveryRequirements,
     verifications: s.verifications.map((v) => ({ name: v.name, result: v.result, exitCode: v.exitCode, durationMs: v.durationMs })),
     claims: s.claims,
-    publications: r.publications,
+
     children,
     packageDir: r.packageDir,
-    archivePath: r.archivePath,
+    briefPath: path.join(r.packageDir, "HANDOFF.md"),
     environment: s.environment,
     capabilities: s.capabilities,
   };
@@ -225,19 +227,15 @@ async function resumeReportsHandler(input: Record<string, unknown>) {
   return clip(rows, Math.max(1, Math.min(100, limit)));
 }
 
-async function remoteHandoffsHandler(input: Record<string, unknown>) {
-  const projectId = str(input, "projectId");
-  const remoteArg = str(input, "remote");
-  const p = projectId ? await findProject(projectId) : undefined;
-  if (projectId && !p) throw new AgentError("not_found", `项目未注册：${projectId}`);
-  const remote = assertSafeGitRemote(remoteArg ?? p?.githubRemote, "remote");
-  const cwd = p?.path ?? process.cwd();
-  const list = await listRemoteHandoffs(cwd, remote);
-  const withMeta = await Promise.all(list.map(async (l) => {
-    const meta = await fetchRemoteMeta(cwd, remote, l.id).catch(() => null);
-    return { id: l.id, sha: l.sha, taskName: meta?.state.taskName ?? null, changeCount: meta?.state.changes.length ?? null };
-  }));
-  return { remote, cwd, ...clip(withMeta, 200) };
+async function handoffTakeoverHandler(input: Record<string, unknown>) {
+  // 与 REST 的 GET /api/handoff-brief 同一份判据（server/core/takeover.ts）：
+  // 两处各写一遍"接手哪一条"，就会出现界面说接 A、Agent 调到 B。
+  return await takeover({
+    handoffId: str(input, "handoffId"),
+    projectId: str(input, "projectId"),
+    at: str(input, "at"),
+    level: (str(input, "level") as "summary" | "files" | "brief" | undefined) ?? "summary",
+  });
 }
 
 async function jobStatusHandler(input: Record<string, unknown>) {
@@ -251,13 +249,12 @@ async function jobStatusHandler(input: Record<string, unknown>) {
  * ------------------------------------------------------------------ */
 
 async function projectRegisterHandler(input: Record<string, unknown>) {
-  const { config, alreadyRegistered } = await registerProjectDir(reqStr(input, "path"), str(input, "name"));
-  return { registered: true, project: config, alreadyRegistered };
+  const { config, alreadyRegistered, bridge } = await registerProjectDir(reqStr(input, "path"), str(input, "name"));
+  return { registered: true, project: config, alreadyRegistered, bridge };
 }
 
 async function projectConfigSaveHandler(input: Record<string, unknown>) {
   const patch: ConfigPatch = { name: str(input, "name") };
-  if (typeof input.githubRemote === "string") patch.githubRemote = input.githubRemote;
   if (input.checks !== undefined) patch.checks = input.checks as unknown[];
   const project = await saveProjectConfig(reqStr(input, "projectId"), patch);
   return { saved: true, project };
@@ -266,9 +263,10 @@ async function projectConfigSaveHandler(input: Record<string, unknown>) {
 async function handoffCreateHandler(input: Record<string, unknown>, ctx: AgentContext) {
   // 封存要在项目目录里跑 git，所以这里要的是同一道目录检查（不是"注册在不在"那么轻）
   const p = await requireGitProject(reqStr(input, "projectId"));
-  const taskName = reqStr(input, "taskName");
+  // taskName 可省：留空就用 ACB 从分支名/提交标题/diff 推断出来的那一句。
+  // 这一条是给"正在干活的 Agent 自己封存"用的 —— 它不该为了封存现编一句人类文案。
   const out = await createHandoff(p, {
-    taskName,
+    taskName: str(input, "taskName"),
     claimText: str(input, "claimText"),
     claimEvidence: str(input, "claimEvidence"),
     nextStep: str(input, "nextStep"),
@@ -278,32 +276,26 @@ async function handoffCreateHandler(input: Record<string, unknown>, ctx: AgentCo
   return {
     handoffId: out.record.handoffId,
     projectId: p.projectId,
+    taskName: out.record.state.taskName,
+    taskSource: out.record.state.inferred?.taskSource ?? "调用方给的任务名",
+    briefPath: path.join(out.record.packageDir, "HANDOFF.md"),
     snapshot: out.snapshot,
     verifications: out.verifications.map((v) => ({ name: v.name, result: v.result, exitCode: v.exitCode })),
     warnings: out.warnings,
     packageDir: out.record.packageDir,
     sealedAt: out.record.sealedAt,
+    /** 项目里因此多了什么：AGENTS.md 接入块与 .acb/LATEST.md 指针（下一个 Agent 自己读的地方） */
+    bridge: out.bridge,
     uptimeMsOfService: Date.now() - ctx.bootedAt,
   };
 }
 
-async function handoffPublishHandler(input: Record<string, unknown>) {
-  const target = reqStr(input, "target") as "local" | "github";
-  const out = await publishHandoff(reqStr(input, "handoffId"), target, str(input, "remote"), str(input, "outPath"));
-  return { receipt: out.receipt, handoffId: out.record.handoffId, projectName: out.projectName };
-}
-
 function resumeRequestFrom(input: Record<string, unknown>): ResumeRequest {
-  const mode = reqStr(input, "mode") as ResumeRequest["mode"];
   return {
-    mode,
-    filePath: str(input, "filePath"),
-    projectId: str(input, "projectId"),
-    remote: str(input, "remote"),
+    projectId: reqStr(input, "projectId"),
     handoffId: str(input, "handoffId"),
     targetDir: reqStr(input, "targetDir"),
     onConflict: (str(input, "onConflict") ?? "abort") as ResumeRequest["onConflict"],
-    archiveSha256: str(input, "archiveSha256"),
   };
 }
 
@@ -323,6 +315,8 @@ async function resumeRestoreHandler(input: Record<string, unknown>) {
     steps: out.report.steps,
     gaps: out.report.gaps,
     error: out.report.error,
+    /** 还原成功时在目标目录装好的接入块与指针（被阻塞的那次是 null，一个字节都没写） */
+    bridge: out.bridge,
   };
 }
 
@@ -349,14 +343,14 @@ export const AGENT_TOOLS: AgentTool[] = [
   },
   {
     name: "acb.projects_list",
-    description: "什么时候用：需要本机注册了哪些项目（跨机交接的第一步）。返回每个项目的 id、名称、目录、已配置检查条数、有没有配 GitHub 远端。数据来自 ~/.acb/projects.json。",
+    description: "什么时候用：要知道本机有哪些项目可以交接（这是找 projectId 的第一站）。返回每个项目的 id、名称、目录、已配置检查条数，以及目录还在不在（注册表里的项目可能被移动过）。数据来自 ~/.acb/projects.json。",
     risk: "read",
     input_schema: EMPTY_INPUT,
     handler: projectsListHandler,
   },
   {
     name: "acb.project_overview",
-    description: "什么时候用：要看某个项目当前 Git 状态与交接概况。返回分支/提交、脏工作区计数（含排除策略）、任务分组、最近 10 条交接、分叉列表。与总览页同源同算法。",
+    description: "什么时候用：要看某个项目当前 Git 状态与交接概况。返回分支/提交、脏工作区计数（含排除策略）、任务分组、最近 10 条交接、分叉列表。与首页状态条同源同算法。",
     risk: "read",
     input_schema: {
       type: "object",
@@ -368,7 +362,7 @@ export const AGENT_TOOLS: AgentTool[] = [
   },
   {
     name: "acb.handoffs_list",
-    description: "什么时候用：列出某项目本机封存的交接（id、任务名、封存时间、改动条数、发布状态、验证条数、父交接）。分页上限 200。",
+    description: "什么时候用：列出某项目本机封存的交接（id、任务名、封存时间、改动条数、简报路径、验证条数、父交接）。分页上限 200。",
     risk: "read",
     input_schema: {
       type: "object",
@@ -383,7 +377,7 @@ export const AGENT_TOOLS: AgentTool[] = [
   },
   {
     name: "acb.handoff_detail",
-    description: "什么时候用：要接手某条交接。返回任务与声明、基线、改动清单（截断到 200 并给总数）、排除项与恢复要求、验证记录、发布回执、子交接、包目录。",
+    description: "什么时候用：要接手某条交接。返回任务与声明、基线、改动清单（截断到 200 并给总数）、排除项与恢复要求、验证记录、子交接、包目录与简报路径。",
     risk: "read",
     input_schema: {
       type: "object",
@@ -392,6 +386,25 @@ export const AGENT_TOOLS: AgentTool[] = [
       required: ["handoffId"],
     },
     handler: handoffDetailHandler,
+  },
+  {
+    name: "acb.handoff_takeover",
+    description:
+      "接手第一条：一次拿到任务、该看哪几个文件、下一步、检查结论、需本机补齐的材料（比读 HANDOFF.md 省 token）。"
+      + "at=<工作目录> 或 projectId / handoffId；level=summary|files|brief。",
+    risk: "read",
+    input_schema: {
+      type: "object",
+      additionalProperties: false,
+      properties: {
+        at: { type: "string", maxLength: 500, description: "接手方所在目录（可以是子目录）" },
+        projectId: { type: "string", maxLength: 200, description: "项目 id" },
+        handoffId: { type: "string", maxLength: 100, description: "指定某条交接" },
+        level: { type: "string", enum: ["summary", "files", "brief"], default: "summary", description: "要多少：摘要 / 只要文件清单 / 简报全文" },
+      },
+      required: [],
+    },
+    handler: handoffTakeoverHandler,
   },
   {
     name: "acb.handoff_integrity",
@@ -419,7 +432,7 @@ export const AGENT_TOOLS: AgentTool[] = [
   },
   {
     name: "acb.resume_reports",
-    description: "什么时候用：想知道上一次在某台电脑上恢复到什么程度、还缺什么。返回恢复报告列表（结论、指纹是否一致、阻塞项、错误）。默认 20 条，上限 100。",
+    description: "什么时候用：想知道上一次把交接还原到某个目录时恢复到什么程度、还缺什么。返回恢复报告列表（结论、指纹是否一致、阻塞项、错误）。默认 20 条，上限 100。",
     risk: "read",
     input_schema: {
       type: "object",
@@ -428,21 +441,6 @@ export const AGENT_TOOLS: AgentTool[] = [
       required: [],
     },
     handler: resumeReportsHandler,
-  },
-  {
-    name: "acb.remote_handoffs",
-    description: "什么时候用：要看远端（GitHub 交接分支或本地裸仓）上有哪些交接。执行 git ls-remote + 取回元数据，只读对象、不动本地分支。remote 必须是允许的远端名/地址（见 acb.project_config_save 的说明）。",
-    risk: "read",
-    input_schema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        projectId: { type: "string", minLength: 1, maxLength: 200, description: "用哪个项目的目录与已配置远端（可省）" },
-        remote: { type: "string", minLength: 1, maxLength: 500, description: "远端名或地址；留空用项目设置里的 githubRemote" },
-      },
-      required: [],
-    },
-    handler: remoteHandoffsHandler,
   },
   {
     name: "acb.job_status",
@@ -458,7 +456,7 @@ export const AGENT_TOOLS: AgentTool[] = [
   },
   {
     name: "acb.project_register",
-    description: "什么时候用：要把一个本地 Git 仓库登记进 ACB。与界面「选择文件夹」走同一条路径：会做工作区/裸仓库判定，误选 .git 时自动改用项目根。可逆的小写入（移除即还原），不需要 confirm。",
+    description: "什么时候用：要把一个本地 Git 仓库登记进 ACB。与界面「选择文件夹」和 CLI 的 register 走同一条路径：会做工作区/裸仓库判定，误选 .git 时自动改用项目根。除注册表条目外还会在项目里写两样东西：<项目>/.acb/LATEST.md（交接指针）与 AGENTS.md 里那段 ACB 接入块（项目不存在该文件时才新建，存在就只在末尾补一段，标记之间的内容才归 ACB 管）。想完全不碰 AGENTS.md：先建一个空文件 <项目>/.acb/NO-BRIDGE 再注册。",
     risk: "write",
     input_schema: {
       type: "object",
@@ -474,7 +472,7 @@ export const AGENT_TOOLS: AgentTool[] = [
   {
     name: "acb.project_config_save",
     description:
-      "什么时候用：改项目名、配 GitHub 远端、或配置检查命令。注意 checks[].cmd 是「以后会被执行的内容」，所以带 checks 时必须显式 confirm:true（这是本项目唯一的命令执行入口，界面里也叫「项目设置」）。githubRemote 会按远端白名单校验。",
+      "什么时候用：改项目名，或配置检查命令。注意 checks[].cmd 是「以后会被执行的内容」，所以带 checks 时必须显式 confirm:true（这是本项目唯一的命令执行入口，界面里就是右上角「换项目 / 管理」）。",
     risk: "write",
     input_schema: {
       type: "object",
@@ -482,7 +480,6 @@ export const AGENT_TOOLS: AgentTool[] = [
       properties: {
         projectId: { type: "string", minLength: 1, maxLength: 200, description: "项目 id" },
         name: { type: "string", minLength: 1, maxLength: 120, description: "新的显示名（可省）" },
-        githubRemote: { type: "string", minLength: 1, maxLength: 500, description: "远端名或 https/ssh/git+ssh 地址；按白名单校验，以 - 开头或 ext:: 一类写法直接拒绝" },
         checks: {
           type: "array",
           maxItems: 50,
@@ -504,7 +501,7 @@ export const AGENT_TOOLS: AgentTool[] = [
     },
     needsConfirm: (input) => {
       // 空串在 schema 校验阶段就按"未填"处理，所以这里只会收到非空 checks；
-      // 写入待执行命令是唯一需要额外确认的情形（清空远端不做成工具入参，避免误伤发布链路）
+      // 写入待执行命令是唯一需要额外确认的情形
       if (input.checks !== undefined) return "这次调用要写入的检查命令以后会在检查阶段被执行";
       return null;
     },
@@ -512,35 +509,34 @@ export const AGENT_TOOLS: AgentTool[] = [
   },
   {
     name: "acb.handoff_preview_resume",
-    description: "什么时候用：恢复之前先看清会发生什么（整包校验 + 与目标目录比对）。一个字节都不写用户目录，是恢复前的必读一步。mode=file|remote|github 与界面同一套判定。",
+    description: "什么时候用：把本机某次封存还原到别的目录之前，先看清会发生什么（整包校验 + 与目标目录比对）。一个字节都不写用户目录，是还原前的必读一步。",
     risk: "read",
     input_schema: {
       type: "object",
       additionalProperties: false,
       properties: {
-        mode: { type: "string", enum: ["file", "remote", "github"], description: "file=本地交接文件；remote=本机封存；github=远端交接分支" },
-        filePath: { type: "string", maxLength: 500, description: "mode=file 时的 .acb.tar.gz 路径" },
-        projectId: { type: "string", maxLength: 200, description: "mode=remote 时的项目 id" },
-        remote: { type: "string", maxLength: 500, description: "mode=github 时的远端；留空用项目设置" },
-        handoffId: { type: "string", maxLength: 100, description: "交接 id（可留空按包内的）" },
+        projectId: { type: "string", minLength: 1, maxLength: 200, description: "交接封存在哪个项目里" },
+        handoffId: { type: "string", maxLength: 100, description: "留空 = 该项目最新一条封存" },
         targetDir: { type: "string", minLength: 1, maxLength: 500, description: "目标目录（推荐空目录）" },
         onConflict: { type: "string", enum: ["abort", "skip", "overwrite"], default: "abort", description: "撞车策略，默认不覆盖" },
-        archiveSha256: { type: "string", maxLength: 80, description: "导出回执里的归档摘要（可选，用于逐字核对）" },
       },
-      required: ["mode", "targetDir"],
+      required: ["projectId", "targetDir"],
     },
     handler: resumePreviewHandler,
   },
   {
     name: "acb.handoff_create",
-    description: `什么时候用：把当前脏工作区（含新文件/删除/重命名）封存成不可变交接包。${confirmNote("会写 <project>/.acb/store 下的包目录与记录，runChecks 时还会执行项目里配置的命令")}。`,
+    description:
+      "把当前脏工作区封存成不可变交接包（也可由正在干活的 Agent 在被换掉前自己调用）。"
+      + "taskName 可留空，用 ACB 从分支名/提交标题/diff 推断的结果。"
+      + confirmNote("写 <project>/.acb/store 下的包目录与记录，并可能更新项目根 AGENTS.md 里 ACB 自己那一段；runChecks 时执行项目配置的命令") + "。",
     risk: "exec",
     input_schema: {
       type: "object",
       additionalProperties: false,
       properties: {
         projectId: { type: "string", minLength: 1, maxLength: 200, description: "项目 id" },
-        taskName: { type: "string", minLength: 1, maxLength: 200, description: "一句另一台电脑上的 Agent 能看懂的话" },
+        taskName: { type: "string", maxLength: 200, description: "一句下一个 Agent 能看懂的话；留空 = 用 ACB 推断出来的任务名" },
         claimText: { type: "string", maxLength: 2000, description: "工作声明（可省）" },
         claimEvidence: { type: "string", maxLength: 2000, description: "证据说明（可省）" },
         nextStep: { type: "string", maxLength: 2000, description: "建议下一步（可省）" },
@@ -548,27 +544,9 @@ export const AGENT_TOOLS: AgentTool[] = [
         parentHandoffIds: { type: "array", maxItems: 20, items: { type: "string", maxLength: 100 }, description: "父交接 id" },
         confirm: { type: "boolean", description: "必须为 true：确认封存交接（必要时含执行检查）" },
       },
-      required: ["projectId", "taskName"],
+      required: ["projectId"],
     },
     handler: handoffCreateHandler,
-  },
-  {
-    name: "acb.handoff_publish",
-    description: `什么时候用：把交接导出为本地 .acb.tar.gz（U 盘路径），或推到 GitHub 专用交接分支 acb/handoff/<id>（先完整生成→再暴露引用→再回读确认，重复发布幂等）。${confirmNote("会写目标文件、并可能向远端推送引用")}`,
-    risk: "exec",
-    input_schema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        handoffId: { type: "string", minLength: 1, maxLength: 100, description: "交接 id" },
-        target: { type: "string", enum: ["local", "github"], description: "导出方式" },
-        remote: { type: "string", maxLength: 500, description: "github 路径的远端；留空用项目设置" },
-        outPath: { type: "string", maxLength: 500, description: "local 路径的输出文件；留空落 ~/Downloads" },
-        confirm: { type: "boolean", description: "必须为 true：确认本次导出/推送" },
-      },
-      required: ["handoffId", "target"],
-    },
-    handler: handoffPublishHandler,
   },
   {
     name: "acb.resume_restore",
@@ -578,17 +556,13 @@ export const AGENT_TOOLS: AgentTool[] = [
       type: "object",
       additionalProperties: false,
       properties: {
-        mode: { type: "string", enum: ["file", "remote", "github"], description: "恢复来源" },
-        filePath: { type: "string", maxLength: 500, description: "mode=file 时的交接文件路径" },
-        projectId: { type: "string", maxLength: 200, description: "mode=remote 时的项目 id" },
-        remote: { type: "string", maxLength: 500, description: "mode=github 时的远端" },
-        handoffId: { type: "string", maxLength: 100, description: "交接 id" },
+        projectId: { type: "string", minLength: 1, maxLength: 200, description: "交接封存在哪个项目里" },
+        handoffId: { type: "string", maxLength: 100, description: "留空 = 该项目最新一条封存" },
         targetDir: { type: "string", minLength: 1, maxLength: 500, description: "目标目录" },
         onConflict: { type: "string", enum: ["abort", "skip", "overwrite"], default: "abort", description: "撞车策略" },
-        archiveSha256: { type: "string", maxLength: 80, description: "期望的归档 SHA-256" },
         confirm: { type: "boolean", description: "必须为 true：确认写目标目录" },
       },
-      required: ["mode", "targetDir"],
+      required: ["projectId", "targetDir"],
     },
     handler: resumeRestoreHandler,
   },
@@ -677,10 +651,11 @@ export async function executeAgentTool(
 export function classifyCoreError(e: unknown): AgentError {
   if (e instanceof AgentError) return e;
   const msg = e instanceof Error ? e.message : String(e);
-  if (e instanceof OverviewNotFound || e instanceof HandoffNotFound || e instanceof ProjectNotRegistered) {
+  if (e instanceof TakeoverAmbiguous || e instanceof UnsafeArgumentError) return new AgentError("bad_input", msg);
+  if (e instanceof OverviewNotFound || e instanceof HandoffNotFound || e instanceof ProjectNotRegistered
+    || e instanceof TakeoverNotFound) {
     return new AgentError("not_found", msg);
   }
-  if (e instanceof UnsafeGitArgumentError) return new AgentError("bad_input", msg);
   if (/出路[：:]/.test(msg)) return new AgentError("bad_input", msg);
   return new AgentError("internal_error", `工具执行失败：${msg}`);
 }

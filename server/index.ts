@@ -2,7 +2,7 @@
 //
 // 安全边界（2026-10-05 验收后的形状，改这里之前先读 server/core/local-guard.ts 的注释）：
 //  · 只绑回环；Host/Origin 不按请求自己的值判；ACB_LOCAL_TOKEN 可以再加一道写权限令牌；
-//  · 任何"要执行的命令"只有一个入口（项目设置里的 checks[].cmd），写它要么走同源回环、要么带令牌；
+//  · 任何"要执行的命令"只有一个入口（「换项目 / 管理」里的 checks[].cmd），写它要么走同源回环、要么带令牌；
 //  · 存储读不出来的时候必须点名文件并降级，不能把一个坏文件变成"所有请求 500"。
 import express from "express";
 import { exec } from "node:child_process";
@@ -13,19 +13,22 @@ import crypto from "node:crypto";
 import type { Server } from "node:http";
 import {
   addProject, findProject, listProjects, removeProject,
-  loadResumeReports, storageNoticeLines,
+  loadResumeReports, storageNoticeLines, publishEndpoint, retractEndpoint,
 } from "./core/store.js";
+import { takeover, TakeoverNotFound, TakeoverAmbiguous } from "./core/takeover.js";
 import { createHandoff } from "./core/workflow.js";
-import { publishHandoff, HandoffNotFound } from "./core/publish.js";
 import { previewResume, performResume, type ResumeRequest } from "./core/resume-flow.js";
 import { buildPreview } from "./core/preview.js";
-import { buildProjectOverview, locateHandoff, measureIntegrity, requireGitProject, OverviewNotFound } from "./core/overview.js";
+import {
+  buildProjectOverview, locateHandoff, measureIntegrity, requireGitProject,
+  OverviewNotFound, HandoffNotFound,
+} from "./core/overview.js";
 import { registerProjectDir, saveProjectConfig, ProjectNotRegistered } from "./core/registry.js";
-import { listRemoteHandoffs, fetchRemoteMeta } from "./core/transport.js";
+import { tryInstallBridge } from "./core/bridge.js";
 import { startJob, getJob } from "./core/jobs.js";
-import { assertSafeGitRemote, assertSafeHandoffId, UnsafeGitArgumentError } from "./core/remote-policy.js";
+import { assertSafeHandoffId, UnsafeArgumentError } from "./core/arg-guard.js";
 import { localGuard, resolveBindHost, assertLoopbackOrigins, DEFAULT_PORT } from "./core/local-guard.js";
-import { createAgentRouter, createHealthHandler } from "./agent/routes.js";
+import { createAgentRouter, createHealthHandler, appVersion } from "./agent/routes.js";
 import type { ProjectConfig } from "../shared/types.js";
 
 const app = express();
@@ -96,8 +99,9 @@ function route<P extends RouteParams>(
       await fn(req, res);
     } catch (e) {
       if (res.headersSent) { next(e); return; }
-      if (e instanceof UnsafeGitArgumentError) { err(res, e, 400); return; }
-      if (e instanceof OverviewNotFound || e instanceof HandoffNotFound || e instanceof ProjectNotRegistered) {
+      if (e instanceof UnsafeArgumentError || e instanceof TakeoverAmbiguous) { err(res, e, 400); return; }
+      if (e instanceof OverviewNotFound || e instanceof HandoffNotFound || e instanceof ProjectNotRegistered
+        || e instanceof TakeoverNotFound) {
         err(res, e, 404);
         return;
       }
@@ -120,12 +124,13 @@ function statusFor(e: unknown): number {
 
 /** 错误必须给得出下一步：把最常见的几种失败翻成动作 */
 function remedy(msg: string): string | undefined {
-  if (/不是 Git 仓库|无法交接|裸仓库/.test(msg)) return "在总览页重新选择一个包含代码的项目根目录（不是 .git 目录），或先 git init";
+  if (/不是 Git 仓库|无法交接|裸仓库/.test(msg)) return "在右上角「换项目 / 管理」里重新选择一个包含代码的项目根目录（不是 .git 目录），或先 git init";
   if (/工作区持续发生变化/.test(msg)) return "停掉 watch 模式的构建/测试，或先提交一次，再重新创建交接";
   if (/目录不存在|不存在:/.test(msg)) return "检查路径是否被移动或改名；桌面版可把文件夹直接拖进窗口";
   if (/大小写/.test(msg)) return "先在源仓库把冲突路径改名，再创建交接";
-  if (/凭据|remote|远端/.test(msg)) return "在项目设置里填写已存在的远端地址，或改用「导出本地文件」走 U 盘路径";
-  if (/完整性|清单/.test(msg)) return "回源电脑重新创建并导出交接；封存后的包按设计不可原地修改";
+  if (/凭据/.test(msg)) return "凭据类文件按设计不进包；在需要运行它的那台机器上自己放一份";
+  if (/完整性|清单/.test(msg)) return "重新创建一次交接；封存后的包按设计不可原地修改";
+  if (/目标目录/.test(msg)) return "换一个不存在或空的目录；要覆盖已有内容就在撞车选项里明确选「覆盖」";
   return undefined;
 }
 
@@ -164,8 +169,8 @@ app.get("/api/projects", route(async (_req, res) => {
 app.post("/api/projects", route(async (req, res) => {
   const { path: p, name } = req.body as { path: string; name?: string };
   if (!p) throw new Error("缺少 path：要点「选择文件夹」，或把项目目录拖进窗口");
-  const { config, alreadyRegistered } = await registerProjectDir(p, name);
-  res.json({ ...config, alreadyRegistered });
+  const { config, alreadyRegistered, bridge } = await registerProjectDir(p, name);
+  res.json({ ...config, alreadyRegistered, bridge });
 }));
 
 app.delete("/api/projects/:id", route(async (req, res) => {
@@ -180,8 +185,8 @@ app.get("/api/projects/:id/config", route(async (req, res) => {
 }));
 
 app.put("/api/projects/:id/config", route(async (req, res) => {
-  const { checks, githubRemote, name } = req.body as Partial<ProjectConfig> & { checks?: unknown[] };
-  const p = await saveProjectConfig(req.params.id, { name, githubRemote, checks });
+  const { checks, name } = req.body as Partial<ProjectConfig> & { checks?: unknown[] };
+  const p = await saveProjectConfig(req.params.id, { name, checks });
   res.json(p);
 }));
 
@@ -190,7 +195,7 @@ app.get("/api/projects/:id/overview", route(async (req, res) => {
   res.json(await buildProjectOverview(req.params.id));
 }));
 
-/** 单个交接的包完整性实测（打开详情页时才跑，避免总览页逐包扫盘） */
+/** 单个交接的包完整性实测（展开交接档案时才跑，避免首页逐包扫盘） */
 app.get("/api/handoffs/:id/integrity", route(async (req, res) => {
   const id = assertSafeHandoffId(req.params.id);
   const located = await locateHandoff(id);
@@ -216,11 +221,11 @@ app.get("/api/jobs/:id", route((req, res) => {
 app.post("/api/projects/:id/handoffs", route(async (req, res) => {
   const p = await requireGitProject(req.params.id);
   const { taskName, claimText, claimEvidence, nextStep, runChecks, parentHandoffIds, async: asJob } = req.body as {
-    taskName: string; claimText?: string; claimEvidence?: string; nextStep?: string;
+    taskName?: string; claimText?: string; claimEvidence?: string; nextStep?: string;
     runChecks?: boolean; parentHandoffIds?: string[]; async?: boolean;
   };
-  if (!taskName || !taskName.trim()) throw new Error("缺少任务名：写一句另一台电脑上的 Agent 能看懂的话，例如「把登录超时从 3s 调到 8s 并补重试」");
-  const input = { taskName: taskName.trim(), claimText, claimEvidence, nextStep, runChecks, parentHandoffIds };
+  // 任务名允许留空：ACB 会从分支名与最近提交里推断（人手写只是覆盖它）
+  const input = { taskName: taskName?.trim() || undefined, claimText, claimEvidence, nextStep, runChecks, parentHandoffIds };
 
   if (asJob) {
     const jobId = startJob("capture", async (report) => createHandoff(p, { ...input, onProgress: report }), remedy);
@@ -230,47 +235,41 @@ app.post("/api/projects/:id/handoffs", route(async (req, res) => {
   res.json(await createHandoff(p, input));
 }));
 
-// ---------- 交接详情 / 发布 ----------
+// ---------- 交接详情 ----------
 app.get("/api/handoffs/:id", route(async (req, res) => {
   const located = await locateHandoff(assertSafeHandoffId(req.params.id));
-  if (!located) throw new HandoffNotFound(`交接不存在：${req.params.id}（确认本机注册表里还有这个项目；跨电脑请用交接文件或 GitHub 交接分支恢复）`);
+  if (!located) throw new HandoffNotFound(`交接不存在：${req.params.id}（确认本机注册表里还有这个项目，且封存目录没被移动过）`);
   res.json({ record: located.record, project: located.project, children: located.children });
 }));
 
-app.post("/api/handoffs/:id/publish", route(async (req, res) => {
-  const { target, remote, outPath } = req.body as { target: "github" | "local"; remote?: string; outPath?: string };
-  if (remote !== undefined && remote !== null && remote !== "") assertSafeGitRemote(remote, "remote");
-  const out = await publishHandoff(assertSafeHandoffId(req.params.id), target, remote ?? undefined, outPath ?? undefined);
-  res.json({ receipt: out.receipt, record: out.record });
-}));
-
-// ---------- 远端交接列表 / 元数据 ----------
-app.get("/api/remotes/handoffs", route(async (req, res) => {
-  const { projectId, remote } = req.query as { projectId?: string; remote?: string };
-  const p = projectId ? await findProject(projectId) : undefined;
-  // 远端值来自 query：先过白名单再交给 git（--upload-pack=<cmd> 这类写法会直接执行命令）
-  const r = assertSafeGitRemote(remote ?? p?.githubRemote ?? "", "remote");
-  const cwd = p?.path ?? os.homedir();
-  const list = await listRemoteHandoffs(cwd, r);
-  const withMeta = await Promise.all(list.map(async (l) => {
-    const meta = await fetchRemoteMeta(cwd, r, l.id).catch(() => null);
-    return { ...l, taskName: meta?.state.taskName ?? null, parentHandoffIds: meta?.state.parentHandoffIds ?? [] };
-  }));
-  res.json(withMeta);
+// ---------- 接手视图（给 Agent 直接调的那一个端点） ----------
+// 三种问法共用 server/core/takeover.ts 一份判据：at=<工作目录> 最省事，其次 projectId / handoffId。
+// 默认 level=summary（摘要，比丢简报原文省 token）；level=files 只回该看哪几个文件；
+// level=brief 才回 HANDOFF.md 全文，format=text 时连 JSON 壳都去掉（没有文件系统的客户端用这条）。
+app.get("/api/handoff-brief", route(async (req, res) => {
+  const q = {
+    at: typeof req.query.at === "string" ? req.query.at : undefined,
+    projectId: typeof req.query.projectId === "string" ? req.query.projectId : undefined,
+    handoffId: typeof req.query.handoffId === "string" ? req.query.handoffId : undefined,
+    level: req.query.level === "files" || req.query.level === "brief" ? req.query.level as "files" | "brief" : "summary" as const,
+  };
+  const out = await takeover(q);
+  if (req.query.format === "text" && typeof out.markdown === "string") {
+    res.type("text/markdown; charset=utf-8").send(out.markdown);
+    return;
+  }
+  res.json(out);
 }));
 
 // ---------- 恢复 ----------
 type ResumeBody = ResumeRequest & { async?: boolean };
 
 app.post("/api/resume/preview", route(async (req, res) => {
-  const b = req.body as ResumeBody;
-  if (b.remote) assertSafeGitRemote(b.remote, "remote");
-  res.json(await previewResume(b));
+  res.json(await previewResume(req.body as ResumeRequest));
 }));
 
 app.post("/api/resume", route(async (req, res) => {
   const b = req.body as ResumeBody;
-  if (b.remote) assertSafeGitRemote(b.remote, "remote");
   if (b.async) {
     const jobId = startJob("restore", (report) => performResume(b, report), remedy);
     res.json({ jobId });
@@ -319,7 +318,9 @@ app.post("/api/demo/seed", route(async (_req, res) => {
     checks: [{ name: "typecheck（演示）", cmd: "node -e \"process.exit(0)\"" }],
   };
   await addProject(cfg);
-  res.json(cfg);
+  // 示例项目也走同一条接入路径：演示里看到的 AGENTS.md / LATEST.md，真项目里也一样会长出来
+  const bridge = await tryInstallBridge(demoPath, { projectId: cfg.projectId, projectName: cfg.name, origin: "注册" }, "示例项目");
+  res.json({ ...cfg, bridge });
 }));
 
 // 桌面模式：同源托管前端静态文件（dist/），SPA 回退（cwd 始终为应用根目录）
@@ -351,17 +352,31 @@ export function startServer(port: number = Number(process.env.ACB_PORT ?? DEFAUL
       const actual = typeof addr === "object" && addr ? addr.port : port;
       bound.port = actual;
       console.log(`[acb] 服务已启动: http://127.0.0.1:${actual}（只监听回环；局域网访问按设计不可用）`);
-      // 固定端口时把实际地址留给 MCP 桥与 personal-agent-hub 发现（随机端口不写，
-      // 否则一次测试/一次桌面启动就会把发现文件改成谁也连不上的旧端口）
-      if (port !== 0) void writeEndpoint(actual);
+      // 发现文件两份都写：agent/.endpoint 是 personal-agent-hub 的约定（打包目录里没有 agent/，
+      // 那里就跳过），~/.acb/endpoint.json 是给"任意客户端、任意端口"用的那一份 ——
+      // 桌面版跑随机端口，没有它外部 Agent 就只能猜 5174。
+      void writeEndpoint(actual);
+      void publishEndpoint({
+        base_url: `http://127.0.0.1:${actual}`,
+        host,
+        port: actual,
+        pid: process.pid,
+        started_at: new Date(BOOTED_AT).toISOString(),
+        version: appVersion(),
+      }).catch(() => undefined);
       resolve({
         server,
         host,
         port: actual,
-        close: () => new Promise<void>((done, failClose) => {
-          server.close((e) => (e ? failClose(e) : done()));
-          server.closeAllConnections?.();
-        }),
+        close: async () => {
+          await new Promise<void>((done, failClose) => {
+            server.close((e) => (e ? failClose(e) : done()));
+            server.closeAllConnections?.();
+          });
+          // 发现文件在 close 真正结束前收回：留一个连不上的地址在 ~/.acb 里，
+          // 下一个客户端就会把"连不上"当成服务坏了。
+          await retractEndpoint(process.pid).catch(() => undefined);
+        },
       });
     });
     server.on("error", (e) => reject(e));

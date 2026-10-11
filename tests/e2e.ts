@@ -1,14 +1,19 @@
-// 端到端验收测试：脏工作区 → 审阅清单 → 封存 → 导出（带摘要回执）→ 还原前预览 → 冲突处理
-// → 异目录恢复 → 形态保真（符号链接/可执行位）→ 发布（本地裸仓当远端）→ 再恢复 → 损坏/越界阻止
-import { execSync } from "node:child_process";
+// 端到端验收测试：脏工作区 → 审阅清单 → 封存（简报自足）→ 还原前预览 → 冲突处理
+// → 异目录恢复 → 形态保真（符号链接/可执行位/空目录/非 ASCII）→ 篡改与越界拦住 → 父子谱系
+// 源只有一个：本机封存存储里的交接包目录。跨电脑不在验收范围内（本产品只做本机 Agent 交接）。
+import { execSync, spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
-import { addProject, loadResumeReports, saveResumeReport } from "../server/core/store.js";
+import { addProject, loadHandoffRecords, loadResumeReports, saveResumeReport, readEndpoint } from "../server/core/store.js";
 import { createHandoff } from "../server/core/workflow.js";
-import { publishLocal, publishGithub } from "../server/core/transport.js";
-import { resumeFromArchive, previewArchiveResume } from "../server/core/resume.js";
+import { registerProjectDir } from "../server/core/registry.js";
+import { cliCandidateRoots, cliInvocation } from "../server/core/bridge.js";
+import { estimateTokens, takeover } from "../server/core/takeover.js";
+import { performResume } from "../server/core/resume-flow.js";
+import { executeAgentTool, AGENT_TOOLS } from "../server/agent/tools.js";
+import { restorePackage, previewPackageResume } from "../server/core/resume.js";
 import { checkEntries, buildManifest } from "../server/core/package.js";
 import { buildPreview, pathFidelityAlerts } from "../server/core/preview.js";
 import {
@@ -27,6 +32,55 @@ function check(name: string, cond: boolean, extra = "") {
   else { fail++; console.error(`FAIL  ${name} ${extra}`); }
 }
 const sh = (cmd: string, cwd: string) => execSync(cmd, { cwd, stdio: "pipe" });
+
+/**
+ * 真起一次 MCP stdio 桥（initialize → tools/list → tools/call）。
+ * 接口这一层光测核心函数不够：工具表按不按 ACB_MCP_TOOLS 收窄、调用回的是不是紧凑 JSON，
+ * 都只活在这个桥里 —— 而 token 成本恰好就记在这两处。
+ */
+async function mcpProbe(port: number, at: string, only: string[]): Promise<{
+  toolNames: string[]; callText: string; listChars: number;
+}> {
+  const root = process.cwd();
+  const child = spawn("node", [path.join(root, "agent", "mcp-server.mjs")], {
+    cwd: root,
+    env: { ...process.env, AGENT_BASE_URL: `http://127.0.0.1:${port}`, ...(only.length ? { ACB_MCP_TOOLS: only.join(",") } : {}) },
+    stdio: ["pipe", "pipe", "ignore"],
+  });
+  const pending = new Map<number, (v: { result?: unknown; error?: unknown }) => void>();
+  let buf = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    buf += chunk;
+    let i = buf.indexOf("\n");
+    while (i >= 0) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      i = buf.indexOf("\n");
+      if (!line) continue;
+      let msg: { id?: number; result?: unknown; error?: unknown };
+      try { msg = JSON.parse(line); } catch { continue; }
+      if (typeof msg.id === "number") { pending.get(msg.id)?.(msg); pending.delete(msg.id); }
+    }
+  });
+  let seq = 0;
+  const rpc = (method: string, params?: unknown) => new Promise<{ result?: unknown }>((res, rej) => {
+    const id = ++seq;
+    const timer = setTimeout(() => rej(new Error(`MCP ${method} 超时`)), 25_000);
+    pending.set(id, (v) => { clearTimeout(timer); res(v as { result?: unknown }); });
+    child.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+  });
+  try {
+    await rpc("initialize", { protocolVersion: "2.2.0", capabilities: {}, clientInfo: { name: "acb-e2e", version: "0" } });
+    const list = await rpc("tools/list") as { result?: { tools?: { name: string }[] } };
+    const names = (list.result?.tools ?? []).map((t) => t.name);
+    const call = await rpc("tools/call", { name: "acb.handoff_takeover", arguments: { at } }) as
+      { result?: { content?: { text?: string }[] } };
+    return { toolNames: names, callText: call.result?.content?.[0]?.text ?? "", listChars: JSON.stringify(list.result?.tools ?? []).length };
+  } finally {
+    child.kill();
+  }
+}
 const sha256FileLocal = async (p: string) => crypto.createHash("sha256").update(await fs.readFile(p)).digest("hex");
 /** 系统临时目录里 ACB 检查用过的物化目录名（只读列举，用于"用完即清"断言） */
 const checkDirs = async (): Promise<string[]> => {
@@ -73,7 +127,7 @@ async function main() {
     taskName: "修复登录超时",
     claimText: "超时参数已从 3s 调整为 8s",
     claimEvidence: "检查通过项",
-    nextStep: "在电脑 B 复跑失败检查",
+    nextStep: "接手后先在本机复跑失败检查",
     runChecks: true,
   });
   const rec = created.record;
@@ -88,16 +142,22 @@ async function main() {
   check("同文件暂存材料独立存在（a.ts）", rec.state.changes.find((c) => c.path === "src/a.ts")?.staged === true);
   check("state 校验通过（seal 前已校验）", rec.state.protocolVersion === "0.1");
 
+  // 接手简报必须自足：下一个 Agent 只读这一份文件就能定位改动、知道下一步、知道复跑哪条命令
+  const briefMd = await fs.readFile(path.join(rec.packageDir, "HANDOFF.md"), "utf8");
+  check("简报逐条列出改动文件路径", briefMd.includes("`src/a.ts`") && briefMd.includes("`tests.ts`")
+    && briefMd.includes("`obsolete.txt`"), `len=${briefMd.length}`);
+  check("简报给出建议下一步原文", briefMd.includes("接手后先在本机复跑失败检查"));
+  check("简报给出可复跑的检查命令", briefMd.includes("console.log") && briefMd.includes("process.exit(1)"));
+  check("简报区分声明与已验证（无证据时标为待确认口径）", briefMd.includes("检查通过项")
+    && !/已验证/.test(briefMd.slice(0, briefMd.indexOf("## 4"))));
+
   // 幂等：再次创建同一内容的新交接（不同 id），用于分叉测试跳过——改为直接测 republish
 
-  // ========== 3. 本地文件导出 ==========
-  const archive = path.join(T, `acb-${rec.handoffId}.acb.tar.gz`);
-  const { receipt: localReceipt } = await publishLocal(rec, archive);
-  check("本地导出成功且读取确认", localReceipt.state === "已发布" && localReceipt.readBackConfirmed);
-
-  // ========== 4. “另一台电脑”恢复（无原目录） ==========
+  // ========== 4. 本机还原到另一个目录（封存过程不动源端工作区） ==========
+  const statusAtCreate = (sh("git status --porcelain", repo)).toString();
+  const headAtCreate = (sh("git rev-parse --abbrev-ref HEAD", repo)).toString().trim();
   const restoreDir = path.join(T, "repoB");
-  const { report } = await resumeFromArchive({ filePath: archive, handoffId: rec.handoffId, targetDir: restoreDir, source: archive });
+  const { report } = await restorePackage({ packageDir: rec.packageDir, handoffId: rec.handoffId, targetDir: restoreDir, source: "本机封存" });
   await saveResumeReport(report);
   check("恢复完成", report.codeRestored === true && report.digestMatch === true);
   check("工作区内容恢复（a.ts 为未暂存版本）", (await fs.readFile(path.join(restoreDir, "src", "a.ts"), "utf8")).includes("a = 3"));
@@ -114,37 +174,10 @@ async function main() {
   check("基线未改动文件保持原样", await fs.access(path.join(restoreDir, "README.md")).then(() => true).catch(() => false)
     && !stB.includes("README.md"));
   check("失败检查如实进入报告判定", report.verdict === "需要重新验证");
-
-  // ========== 5. GitHub 路径（本地裸仓模拟远端，走同一 git push 代码路径） ==========
-  const bare = path.join(T, "remote.git");
-  sh(`git init -q --bare "${bare}"`, T);
-  const remoteUrl = process.platform === "win32" ? bare : bare;
-  const { receipt: ghReceipt } = await publishGithub(repo, rec, remoteUrl);
-  check("发布到交接分支并读取确认", ghReceipt.state === "已发布" && ghReceipt.readBackConfirmed, JSON.stringify(ghReceipt));
-  check("专用分支命名", ghReceipt.location.includes(`acb/handoff/${rec.handoffId}`));
-  check("源端分支未被移动", (sh("git rev-parse --abbrev-ref HEAD", repo)).toString().trim() !== `acb/handoff/${rec.handoffId}`);
-  const beforeIndex = (sh("git status --porcelain", repo)).toString();
-  check("源端暂存区/工作区未被改变（发布前后状态一致）", beforeIndex.length > 0);
-
-  // 幂等重发：同一交接再发布 → SHA 不变
-  const { receipt: ghReceipt2 } = await publishGithub(repo, rec, remoteUrl);
-  check("重复发布幂等（同一提交）", ghReceipt2.commitSha === ghReceipt.commitSha);
-
-  // 远端元数据可读
-  const { listRemoteHandoffs, fetchRemoteMeta } = await import("../server/core/transport.js");
-  const remoteList = await listRemoteHandoffs(repo, remoteUrl);
-  check("远端列出交接", remoteList.length === 1 && remoteList[0].id === rec.handoffId);
-  const meta = await fetchRemoteMeta(repo, remoteUrl, rec.handoffId);
-  check("远端元数据可读", meta?.state.taskName === "修复登录超时");
-
-  // ========== 5.5 从 GitHub 交接分支直接恢复（跨电脑路径） ==========
-  const ghRestore = path.join(T, "repoGH");
-  const { resumeFromGithub } = await import("../server/core/resume.js");
-  const gh = await resumeFromGithub({ remote: remoteUrl, handoffId: rec.handoffId, targetDir: ghRestore });
-  check("GitHub 交接分支恢复成功", gh.report.codeRestored === true && gh.report.digestMatch === true);
-  check("GitHub 恢复暂存/未暂存分离", ((sh("git status --porcelain", ghRestore)).toString()).includes("MM src/a.ts"));
-  check("GitHub 恢复接手入口存在", await fs.access(path.join(ghRestore, "ACB-HANDOFF.md")).then(() => true).catch(() => false));
-  check("GitHub 恢复无基线残留（README 原样）", !((sh("git status --porcelain", ghRestore)).toString()).includes("README.md"));
+  check("封存与还原都不动源端工作区", (sh("git status --porcelain", repo)).toString() === statusAtCreate,
+    (sh("git status --porcelain", repo)).toString());
+  check("封存与还原都不动源端分支", (sh("git rev-parse --abbrev-ref HEAD", repo)).toString().trim() === headAtCreate);
+  check("还原目录自带接手简报", await fs.access(path.join(restoreDir, "ACB-HANDOFF.md")).then(() => true).catch(() => false));
 
   // ========== 6. 电脑 B 接续：从恢复目录创建子交接（父子关系） ==========
   const cfgB: ProjectConfig = { projectId: "prj_e2e02", name: "e2e-repo-B", path: restoreDir, checks: [] };
@@ -155,51 +188,51 @@ async function main() {
 
   // ========== 7. 本机存储恢复路径 ==========
   const restoreDir2 = path.join(T, "repoC");
-  const { report: report2 } = await resumeFromArchive({ packageDir: rec.packageDir, targetDir: restoreDir2, source: "本机存储" });
+  const { report: report2 } = await restorePackage({ packageDir: rec.packageDir, targetDir: restoreDir2, source: "本机存储" });
   await saveResumeReport(report2);
   check("本机存储恢复同样一致（交接 ID 可省，以包内为准）", report2.digestMatch === true);
   check("恢复回执带条目数与写入数", report2.entryCount !== undefined && report2.restoredCount !== undefined && (report2.restoredCount ?? 0) > 0);
 
-  // ========== 7.1 解包临时目录不残留 ==========
-  const leftover = (await fs.readdir(path.dirname(archive))).filter((f) => f.startsWith(".acb-extract-"));
-  check("解压临时目录已回收（不在用户目录旁边留残骸）", leftover.length === 0, JSON.stringify(leftover));
-
-  // ========== 7.2 归档摘要可核对（两台电脑比对用） ==========
-  const { receipt: localReceipt2 } = await publishLocal(rec, archive);
-  const realSha = await sha256FileLocal(archive);
-  check("导出回执记录归档 SHA-256 与体积", localReceipt2.archiveSha256 === realSha && (localReceipt2.archiveBytes ?? 0) > 0);
-  let shaMismatchBlocked = false;
-  try {
-    await resumeFromArchive({ filePath: archive, handoffId: rec.handoffId, targetDir: path.join(T, "repoSha"), source: archive, archiveSha256: "f".repeat(64) });
-  } catch (e) { shaMismatchBlocked = /摘要与回执不符/.test(String((e as Error).message)); }
-  check("归档摘要与回执不符时拒绝恢复", shaMismatchBlocked);
+  // ========== 7.2 封存包不被还原消费；材料被篡改时在写盘前就停住 ==========
+  const again = await restorePackage({ packageDir: rec.packageDir, targetDir: path.join(T, "repoReconsume"), source: "本机封存（再还原一次）" });
+  check("还原不消费封存包：同一条再还原一次仍然指纹一致", again.report.digestMatch === true);
+  const tamperDir = path.join(T, "repoTamper");
+  const tamperedFile = path.join(rec.packageDir, "payload", "work", "src", "a.ts");
+  const keepBytes = await fs.readFile(tamperedFile);
+  await fs.writeFile(tamperedFile, "恢复材料被改过一个字节");
+  const tamperRes = await restorePackage({ packageDir: rec.packageDir, targetDir: tamperDir, source: "本机封存（已篡改）" });
+  await fs.writeFile(tamperedFile, keepBytes);
+  check("材料被篡改时完整性核对不通过", (tamperRes.report.verifiedCount ?? 0) < (tamperRes.report.entryCount ?? 0),
+    `verified=${tamperRes.report.verifiedCount}/${tamperRes.report.entryCount}`);
+  check("篡改包在写盘前就被拦住（判定恢复被阻塞）", tamperRes.report.verdict === "恢复被阻塞");
+  check("被拦住时没有写出目标目录", (await fs.readdir(tamperDir).then((f) => f.length).catch(() => 0)) === 0);
 
   // ========== 7.3 还原前预览与冲突处理 ==========
   const conflictDir = path.join(T, "repoConflict");
   await fs.mkdir(path.join(conflictDir, "src"), { recursive: true });
   await fs.writeFile(path.join(conflictDir, "src", "a.ts"), "本机已改，不能被覆盖\n");
-  const pre = await previewArchiveResume({ filePath: archive, targetDir: conflictDir, source: archive });
+  const pre = await previewPackageResume({ packageDir: rec.packageDir, targetDir: conflictDir, source: "本机封存" });
   check("预览报告完整性与将写入数", pre.integrityOk === true && pre.willWrite > 0 && pre.entryCount === pre.verifiedCount);
   check("预览不写盘（目标目录里那个文件还是原样）",
     (await fs.readFile(path.join(conflictDir, "src", "a.ts"), "utf8")).includes("不能被覆盖"));
   check("预览列出撞车项", pre.conflicts.some((c) => c.path === "src/a.ts" && !c.identical));
-  const abortRes = await resumeFromArchive({ filePath: archive, targetDir: conflictDir, source: archive, onConflict: "abort" });
+  const abortRes = await restorePackage({ packageDir: rec.packageDir, targetDir: conflictDir, source: "本机封存", onConflict: "abort" });
   check("冲突默认停止不覆盖（判定为恢复被阻塞）", abortRes.report.verdict === "恢复被阻塞"
     && abortRes.report.gaps.some((g) => g.blocking && /冲突/.test(g.title)));
-  const skipRes = await resumeFromArchive({ filePath: archive, targetDir: conflictDir, source: archive, onConflict: "skip" });
+  const skipRes = await restorePackage({ packageDir: rec.packageDir, targetDir: conflictDir, source: "本机封存", onConflict: "skip" });
   check("「跳过已存在」保留本机文件", skipRes.report.digestMatch !== true
     && (await fs.readFile(path.join(conflictDir, "src", "a.ts"), "utf8")).includes("不能被覆盖"));
   const owDir = path.join(T, "repoOverwrite");
   await fs.mkdir(path.join(owDir, "src"), { recursive: true });
   await fs.writeFile(path.join(owDir, "src", "a.ts"), "旧内容\n");
-  const owRes = await resumeFromArchive({ filePath: archive, targetDir: owDir, source: archive, onConflict: "overwrite" });
+  const owRes = await restorePackage({ packageDir: rec.packageDir, targetDir: owDir, source: "本机封存", onConflict: "overwrite" });
   check("「用包内覆盖」还原成功且指纹一致", owRes.report.digestMatch === true
     && (await fs.readFile(path.join(owDir, "src", "a.ts"), "utf8")).includes("a = 3"));
 
   // ========== 7.4 填错交接 ID 被拒绝并说清怎么办 ==========
   let idMismatchMsg = "";
   try {
-    await resumeFromArchive({ filePath: archive, handoffId: "hnd_deadbeef", targetDir: path.join(T, "repoId"), source: archive });
+    await restorePackage({ packageDir: rec.packageDir, handoffId: "hnd_deadbeef", targetDir: path.join(T, "repoId"), source: "本机封存" });
   } catch (e) { idMismatchMsg = String((e as Error).message); }
   check("包内 ID 与请求 ID 不一致时拒绝并给出出路", /不一致/.test(idMismatchMsg) && /留空/.test(idMismatchMsg));
 
@@ -236,10 +269,8 @@ async function main() {
   const linkChange = createdM.record.state.changes.find((c) => c.path === "src/link.ts");
   check("可执行位以 100755 进入交接状态", execChange?.mode === "100755", JSON.stringify(execChange));
   check("符号链接以 120000 进入交接状态（不再被当成普通文件）", linkChange?.mode === "120000", JSON.stringify(linkChange));
-  const archiveM = path.join(T, `acb-${createdM.record.handoffId}.acb.tar.gz`);
-  await publishLocal(createdM.record, archiveM);
   const modeDir = path.join(T, "repoModeRestored");
-  const rM = await resumeFromArchive({ filePath: archiveM, targetDir: modeDir, source: archiveM });
+  const rM = await restorePackage({ packageDir: createdM.record.packageDir, targetDir: modeDir, source: "本机封存" });
   check("形态保真的包恢复后代码指纹一致（符号链接不会造成假阴性）", rM.report.digestMatch === true,
     rM.report.steps.find((s) => s.title === "代码指纹复算")?.detail ?? "");
   const idxAfter = sh("git ls-files -s", modeDir).toString();
@@ -276,6 +307,13 @@ async function main() {
     createdS.record.state.excluded.includes(".env.local")
     && createdS.record.state.recoveryRequirements.some((r) => r.includes(".env.local"))
     && !createdS.record.state.changes.some((c) => c.path === ".env.local"));
+  // 刚封存的那条交接就躺在项目里的 .acb/ 下：目录型排除必须折成一条，
+  // 否则排除清单会随交接次数线性变长，把真正要看的 .env 埋掉
+  const prevS2 = await buildPreview(cfgS);
+  check("目录型排除折叠成一条并给出命中数",
+    prevS2.excluded.some((e) => e.path === ".acb/" && /命中 \d+ 个文件/.test(e.reason))
+    && !prevS2.excluded.some((e) => e.path.startsWith(".acb/store/")), JSON.stringify(prevS2.excluded.map((e) => e.path)));
+  check("折叠不影响逐条列出的凭据", prevS2.excluded.some((e) => e.path === ".env.local" && e.kind === "凭据"));
 
   // ========== 7.9 大小写碰撞：单测 + 真仓库拦住 ==========
   const col = caseCollisions(["src/A.ts", "src/a.ts", "src/b.ts"]);
@@ -335,10 +373,8 @@ async function main() {
     prevU.alerts.some((a) => /\u7a7a\u76ee\u5f55/.test(a.title)), JSON.stringify(prevU.alerts.map((a) => a.title)));
   const createdU = await createHandoff(cfgU, { taskName: "\u975e ASCII \u4e0e\u7a7a\u76ee\u5f55\u4fdd\u771f", runChecks: false });
   check("\u7a7a\u76ee\u5f55\u8fdb\u5165\u4ea4\u63a5\u72b6\u6001", (createdU.record.state.emptyDirs ?? []).length >= 2, JSON.stringify(createdU.record.state.emptyDirs));
-  const archiveU = path.join(T, `acb-${createdU.record.handoffId}.acb.tar.gz`);
-  await publishLocal(createdU.record, archiveU);
   const uniDir = path.join(T, "repoUniRestored");
-  const rU = await resumeFromArchive({ filePath: archiveU, targetDir: uniDir, source: archiveU });
+  const rU = await restorePackage({ packageDir: createdU.record.packageDir, targetDir: uniDir, source: "本机封存" });
   check("\u4e2d\u6587\u540d\u57fa\u7ebf\u6587\u4ef6\u771f\u7684\u843d\u5230\u4e86\u76ee\u5f55", await fs.stat(path.join(uniDir, "\u4e2d\u6587\u6587\u4ef6.md")).then(() => true).catch(() => false));
   check("\u4e2d\u6587\u76ee\u5f55\u4e0b\u7684\u57fa\u7ebf\u6587\u4ef6\u843d\u5730", await fs.stat(path.join(uniDir, "src", "\u6587\u6863", "\u63a5\u53e3.ts")).then(() => true).catch(() => false));
   const stU = sh("git status --porcelain", uniDir).toString();
@@ -372,13 +408,13 @@ async function main() {
   const leftoverDir = path.join(T, "repoLeftover");
   await fs.mkdir(leftoverDir, { recursive: true });
   await fs.writeFile(path.join(leftoverDir, "\u672c\u673a\u65e7\u6587\u4ef6.txt"), "\u8fd9\u662f\u63a5\u6536\u7535\u8111\u81ea\u5df1\u7684\u4e1c\u897f\n");
-  const preL = await previewArchiveResume({ filePath: archiveU, targetDir: leftoverDir, source: archiveU });
+  const preL = await previewPackageResume({ packageDir: createdU.record.packageDir, targetDir: leftoverDir, source: "本机封存" });
   check("\u9884\u89c8\u5c31\u80fd\u770b\u89c1\u300c\u53ea\u5728\u76ee\u6807\u300d\u7684\u672c\u673a\u6587\u4ef6",
     (preL.onlyInTarget ?? []).includes("\u672c\u673a\u65e7\u6587\u4ef6.txt"), JSON.stringify(preL.onlyInTarget));
   check("\u9884\u89c8\u62ff\u5230\u4e86\u57fa\u7ebf\u6e05\u5355\uff08\u80fd\u533a\u5206\u5305\u5185\u5bb9\u4e0e\u672c\u673a\u6587\u4ef6\uff09",
     preL.baselineListed === true && (preL.baselineMissingInTarget ?? 0) >= 3,
     JSON.stringify({ listed: preL.baselineListed, missing: preL.baselineMissingInTarget, total: preL.packagePathCount }));
-  const rL = await resumeFromArchive({ filePath: archiveU, targetDir: leftoverDir, source: archiveU, onConflict: "skip" });
+  const rL = await restorePackage({ packageDir: createdU.record.packageDir, targetDir: leftoverDir, source: "本机封存", onConflict: "skip" });
   check("\u56de\u6267\u5217\u51fa\u300c\u53ea\u5728\u76ee\u6807\u300d\u7684\u672c\u673a\u6587\u4ef6",
     (rL.report.receipt?.onlyInTarget ?? []).includes("\u672c\u673a\u65e7\u6587\u4ef6.txt"), JSON.stringify(rL.report.receipt));
   check("\u300c\u53ea\u5728\u76ee\u6807\u300d\u4e0d\u628a\u4ea4\u63a5\u5185\u5bb9\u7b97\u8fdb\u53bb",
@@ -399,7 +435,7 @@ async function main() {
   const collisionManifest = await buildManifest(evilPkg, evilState);
   await fs.writeFile(path.join(evilPkg, "manifest.json"), JSON.stringify(collisionManifest, null, 2));
   const collideDir = path.join(T, "repoCollide");
-  const rCol = await resumeFromArchive({ packageDir: evilPkg, targetDir: collideDir, source: "\u672c\u673a\u5b58\u50a8\uff08\u4f2a\u9020\u78b0\u649e\u5305\uff09" });
+  const rCol = await restorePackage({ packageDir: evilPkg, targetDir: collideDir, source: "\u672c\u673a\u5b58\u50a8\uff08\u4f2a\u9020\u78b0\u649e\u5305\uff09" });
   check("\u4f2a\u9020\u540e\u5305\u5b8c\u6574\u6027\u4ecd\u901a\u8fc7\uff08\u6d4b\u7684\u662f\u78b0\u649e\u5224\u636e\u4e0d\u662f\u635f\u574f\u5224\u636e\uff09",
     rCol.report.steps.some((s) => s.title === "\u6062\u590d\u524d\u6821\u9a8c" && s.ok),
     JSON.stringify(rCol.report.steps[1]));
@@ -431,35 +467,220 @@ async function main() {
     pathFidelityAlerts(["src/A.ts", "src/a.ts"]).every((a) => a.level === "\u963b\u585e")
     && pathFidelityAlerts(["src/A.ts", "src/a.ts"]).length >= 1);
 
-  // ========== 7.14 GitHub \u8def\u5f84\u4e5f\u8981\u4fdd\u7559\u5f62\u6001\uff08\u5199\u6b7b 100644 \u4f1a\u628a\u94fe\u63a5\u4e0e\u6267\u884c\u4f4d\u62b9\u5e73\uff09 ==========
-  const bareU = path.join(T, "remoteU.git");
-  sh(`git init -q --bare "${bareU}"`, T);
-  const { receipt: ghU } = await publishGithub(repoU, createdU.record, bareU);
-  check("\u975e ASCII/\u5f62\u6001\u4fdd\u771f\u7684\u5305\u80fd\u53d1\u5e03\u5230\u4ea4\u63a5\u5206\u652f", ghU.state === "\u5df2\u53d1\u5e03" && ghU.readBackConfirmed, JSON.stringify(ghU));
-  const ghUDir = path.join(T, "repoUniFromGithub");
-  const ghURes = await resumeFromGithub({ remote: bareU, handoffId: createdU.record.handoffId, targetDir: ghUDir });
-  check("GitHub \u8def\u5f84\u6062\u590d\u540e\u6307\u7eb9\u4e00\u81f4", ghURes.report.digestMatch === true,
-    ghURes.report.steps.find((s) => s.title === "\u4ee3\u7801\u6307\u7eb9\u590d\u7b97")?.detail ?? "");
-  const ghIdx = sh("git -c core.quotepath=false ls-files -s", ghUDir).toString();
-  check("GitHub \u8def\u5f84\u4fdd\u7559 100755 \u6267\u884c\u4f4d", /^100755\s+[0-9a-f]{40}\s+\d+\s+run\.sh$/m.test(ghIdx), ghIdx);
-  check("GitHub \u8def\u5f84\u4fdd\u7559 120000 \u7b26\u53f7\u94fe\u63a5", /^120000\s+[0-9a-f]{40}\s+\d+\s+\u6307\u5411\u6e90\u7801$/m.test(ghIdx), ghIdx);
-  check("GitHub \u8def\u5f84\u4e5f\u91cd\u5efa\u7a7a\u76ee\u5f55", await fs.stat(path.join(ghUDir, "\u5360\u4f4d")).then((s) => s.isDirectory()).catch(() => false));
-  check("GitHub \u8def\u5f84\u7684\u4e2d\u6587\u57fa\u7ebf\u6587\u4ef6\u843d\u5730", await fs.stat(path.join(ghUDir, "\u4e2d\u6587\u6587\u4ef6.md")).then(() => true).catch(() => false));
+  // ========== 7.15 自动推断：人不写任务与现状，交接也得有内容 ==========
+  const repoI = path.join(T, "repoInfer");
+  await fs.mkdir(path.join(repoI, "src", "auth"), { recursive: true });
+  await fs.mkdir(path.join(repoI, "tests"), { recursive: true });
+  const shI = (c: string) => execSync(c, { cwd: repoI, stdio: "pipe" }).toString();
+  shI("git init -q -b feat/login-timeout");
+  shI("git config user.email i@i.local && git config user.name infer");
+  await fs.writeFile(path.join(repoI, "src/auth/session.ts"), "export const TIMEOUT = 3000;\n");
+  await fs.writeFile(path.join(repoI, "tests/session.test.ts"), "test('login', () => {});\n");
+  shI("git add -A && git commit -qm \"调整登录超时并加重试\"");
+  await fs.writeFile(path.join(repoI, "src/auth/session.ts"),
+    "export const TIMEOUT_MS = 8000;\nexport function retryWithBackoff(n: number) {\n  // TODO: 退避上限还没定\n  return n * 2;\n}\n");
+  await fs.writeFile(path.join(repoI, "src/auth/retry.ts"), "export const MAX_RETRY = 3;\n");
+  const cfgI: ProjectConfig = { projectId: "prj_infer", name: "infer-repo", path: repoI, checks: [] };
+  await addProject(cfgI);
+  const prevI = await buildPreview(cfgI);
+  check("预览带来自现场的推断任务名", prevI.inferred.taskName === "调整登录超时并加重试"
+    && /最近提交/.test(prevI.inferred.taskSource), JSON.stringify(prevI.inferred).slice(0, 200));
+  check("推断出新增的符号（不用人写\"我改了什么\"）",
+    prevI.inferred.progress.some((p) => p.includes("TIMEOUT_MS")) && prevI.inferred.progress.some((p) => p.includes("retryWithBackoff")),
+    prevI.inferred.progress.join(" / "));
+  check("把代码里的 TODO 当成下一步线索（上一个 Agent 自己留的话）",
+    prevI.inferred.nextSteps.some((n) => /TODO/.test(n) && n.includes("退避上限还没定")));
+  check("改了源码没改测试被点名，且标明是推断",
+    prevI.inferred.nextSteps.some((n) => n.includes("tests/session.test.ts") && /推断/.test(n)));
+  const noName = await createHandoff(cfgI, { runChecks: false });
+  check("不填任务名也能封存，任务名来自推断", noName.record.state.taskName === "调整登录超时并加重试"
+    && noName.record.state.taskName !== "未命名任务");
+  check("简报里如实标注任务名是推断来的",
+    (await fs.readFile(path.join(noName.record.packageDir, "HANDOFF.md"), "utf8")).includes("任务名来源"));
+  await fs.mkdir(path.join(repoI, ".acb"), { recursive: true });
+  await fs.writeFile(path.join(repoI, ".acb/NEXT.md"), "还差退避上限；先跑 tests/session.test.ts 再动 retry.ts。\n");
+  const withNote = await createHandoff(cfgI, { runChecks: false });
+  check("上一个 Agent 的便签被采纳为声明", withNote.record.state.claims.some((c) => c.sessionId === "agent_note"
+    && c.text.includes("还差退避上限")));
+  const noteMd = await fs.readFile(path.join(withNote.record.packageDir, "HANDOFF.md"), "utf8");
+  check("简报把便签原文放进\"做到哪了\"", noteMd.includes("还差退避上限") && noteMd.includes(".acb/NEXT.md"));
+  check("便签不作为人的声明混入（会话身份单列）",
+    !withNote.record.state.claims.some((c) => c.sessionId === "sess_web"));
 
-  // ========== 7.15 检查用的临时物化目录用完即清 ==========
-  // 只断言本次自己创建的那几个快照目录：同名前缀的其它目录可能属于并行运行，不该由本测试处置
-  const mySnaps = [created.snapshot.id, createdM.record.state.snapshotId, createdS.record.state.snapshotId];
-  const nowDirs = await checkDirs();
-  const stillMine = mySnaps.filter((s) => nowDirs.includes(`acb-check-${s}`));
-  check("检查物化目录在批次结束后被回收", stillMine.length === 0, JSON.stringify(stillMine));
+  // ========== 7.16 项目侧接入：交接由项目里的 Agent 自己读到，人不转述任何文字 ==========
+  // 这一块是"工具 vs 提示词"的分界：如果交接只能靠人粘一段话，那 ACB 就只是个提示词生成器。
+  // 所以断言的目标是"没有人参与也走得通"：注册即装接入块、封存重写指针、Agent 零输入自封存、
+  // 还原出来的目录同样自读；同时工具的脚印不能伪装成用户的改动。
+  const repoJ = path.join(T, "repoBridge");
+  await fs.mkdir(path.join(repoJ, "src"), { recursive: true });
+  const shJ = (c: string) => execSync(c, { cwd: repoJ, stdio: "pipe" }).toString();
+  // 文件缺失要变成一条 FAIL，而不是把整个套件炸在这里（炸了的变异不算"证明了它能失败"）
+  const readOr = async (p: string) => await fs.readFile(p, "utf8").catch(() => "（文件不存在）");
+  shJ("git init -q -b feat/bridge-check");
+  shJ("git config user.email j@j.local && git config user.name bridge");
+  await fs.writeFile(path.join(repoJ, "src/a.ts"), "export const a = 1;\n");
+  shJ("git add -A && git commit -qm \"接入块检查\"");
+  await fs.writeFile(path.join(repoJ, "src/a.ts"), "export const a = 2;\n");
+  const regJ = await registerProjectDir(repoJ, "bridge-repo");
+  const agentsJ = path.join(repoJ, "AGENTS.md");
+  const latestJ = path.join(repoJ, ".acb", "LATEST.md");
+  check("注册就在项目里装上接入块与指针（没有人教过任何 Agent）",
+    regJ.bridge.agents === "created" && regJ.bridge.latest === "created"
+    && (await readOr(agentsJ)).includes("ACB:BEGIN")
+    && (await readOr(latestJ)).includes("create " + regJ.config.projectId),
+    JSON.stringify(regJ.bridge));
+
+  // 指针里那条自封存命令必须是"这次真正在跑的那个入口"，不能跟着敲命令的人站在哪个目录变：
+  // 从源码树里跑一次发行包的 cli，就把 dist-server 写进项目指针，双击 exe 接手时那条路径根本不存在。
+  const cliRoots = cliCandidateRoots();
+  check("入口查找以启动本进程的那个文件为先，cwd 只作最后兜底",
+    cliRoots[0] === path.dirname(path.resolve(process.argv[1] ?? ""))
+    && cliRoots[cliRoots.length - 1] === path.resolve(process.cwd()), JSON.stringify(cliRoots));
+  const cliRootsProbe = path.join(T, "cli-roots");
+  await fs.mkdir(path.join(cliRootsProbe, "pkg"), { recursive: true });
+  await fs.mkdir(path.join(cliRootsProbe, "empty"), { recursive: true });
+  await fs.writeFile(path.join(cliRootsProbe, "pkg", "cli.cjs"), "");
+  const picked = cliInvocation([path.join(cliRootsProbe, "pkg"), cliRootsProbe]);
+  check("指针里的入口按清单第一个命中，一个都没有时如实说没有（不是猜一个）",
+    picked?.run === `node "${path.join(cliRootsProbe, "pkg", "cli.cjs")}"`
+    && cliInvocation([path.join(cliRootsProbe, "empty")]) === null, JSON.stringify(picked));
+
+  const sJ1 = await createHandoff(regJ.config, { runChecks: false });
+  const sJ2 = await createHandoff(regJ.config, { runChecks: false });
+  const agentsTwice = await readOr(agentsJ);
+  check("反复封存：接入块只有一份，指针每封一次重写一次",
+    (agentsTwice.match(/ACB:BEGIN/g) ?? []).length === 1
+    && sJ1.bridge.agents === "unchanged" && sJ2.bridge.agents === "unchanged" && sJ2.bridge.latest === "updated",
+    JSON.stringify(sJ1.bridge) + JSON.stringify(sJ2.bridge));
+  const latestAfter = await readOr(latestJ);
+  check("指针说的是最新那次封存，不是历史里最旧的那条",
+    latestAfter.includes("当前交接：`" + sJ2.record.handoffId + "`")
+    && !latestAfter.includes("当前交接：`" + sJ1.record.handoffId + "`"));
+
+  const agentsBytesBefore = await fs.readFile(agentsJ).catch(() => Buffer.alloc(0));
+  await fs.writeFile(path.join(repoJ, ".acb", "NO-BRIDGE"), "");
+  const sJ3 = await createHandoff(regJ.config, { runChecks: false });
+  check("项目里有 .acb/NO-BRIDGE 时 AGENTS.md 一个字节都不改，指针照写",
+    sJ3.bridge.agents === "skipped" && /NO-BRIDGE/.test(sJ3.bridge.reason ?? "")
+    && Buffer.compare(agentsBytesBefore, await fs.readFile(agentsJ)) === 0
+    && sJ3.bridge.latest === "updated", JSON.stringify(sJ3.bridge));
+  await fs.rm(path.join(repoJ, ".acb", "NO-BRIDGE"), { force: true });
+
+  await fs.writeFile(agentsJ, "我的说明\n<!-- ACB:BEGIN -->\n半截标记没有结束\n");
+  const sJ4 = await createHandoff(regJ.config, { runChecks: false });
+  const halfKept = await readOr(agentsJ);
+  check("标记残缺时不改文件，并说得出是哪个标记",
+    sJ4.bridge.agents === "skipped" && /标记不完整/.test(sJ4.bridge.reason ?? "")
+    && halfKept.includes("半截标记没有结束"), JSON.stringify(sJ4.bridge));
+
+  // 人写的 AGENTS.md 不能被吃掉：接入块追加在后面，原文一字不少
+  await fs.writeFile(agentsJ, "我自己的项目说明：先跑 make lint\n");
+  const regK = await registerProjectDir(repoJ, "bridge-repo");
+  const mergedAgents = await readOr(agentsJ);
+  check("已有 AGENTS.md 时只追加一段，人的原文一字不动",
+    regK.bridge.agents === "appended" && mergedAgents.startsWith("我自己的项目说明：先跑 make lint")
+    && (mergedAgents.match(/ACB:BEGIN/g) ?? []).length === 1);
+
+  // 工具的脚印不能伪装成用户的改动（判据是逐行比对，不是文件名）
+  await fs.writeFile(agentsJ, (await readOr(agentsJ)).replace(/^我自己的项目说明：先跑 make lint\n+/, ""));
+  const prevJ = await buildPreview(regJ.config);
+  check("只有接入块的 AGENTS.md 被认成工具脚印，不进进度",
+    prevJ.inferred.acbOwnEdits.includes("AGENTS.md")
+    && !prevJ.inferred.progress.some((p) => /^\s*-\s*AGENTS\.md/.test(p))
+    && prevJ.inferred.progress.some((p) => p.includes("ACB 自己写的接入块")),
+    prevJ.inferred.progress.join(" / "));
+  check("审阅清单单列一条提示：这不是你的改动",
+    prevJ.alerts.some((a) => a.level === "提示" && /ACB 自己写的/.test(a.title) && a.action.includes("NO-BRIDGE")));
+  const sJ5 = await createHandoff(regJ.config, { runChecks: false });
+  check("简报里也标明这一项是 ACB 写的接入块",
+    (await fs.readFile(path.join(sJ5.record.packageDir, "HANDOFF.md"), "utf8"))
+      .includes("（ACB 自己写的接入块，不属于这次的任务）"));
+  // 反过来：人往同一个文件里加了内容，就不能再算工具的脚印
+  await fs.writeFile(agentsJ, (await readOr(agentsJ)) + "\n人手补了一句：记得改 Makefile\n");
+  const prevJ2 = await buildPreview(regJ.config);
+  check("混了人手内容的 AGENTS.md 不再算工具脚印（不是按文件名放行）",
+    !prevJ2.inferred.acbOwnEdits.includes("AGENTS.md")
+    && prevJ2.inferred.progress.some((p) => /AGENTS\.md/.test(p)));
+  await fs.writeFile(agentsJ, (await readOr(agentsJ)).replace(/\n人手补了一句：记得改 Makefile\n$/, ""));
+
+  // Agent 侧：一个字段都不填也要能自己封存（这是"被换掉之前自己交接"的那条路）
+  const selfSeal = await executeAgentTool("acb.handoff_create",
+    { projectId: regJ.config.projectId, confirm: true }, { bootedAt: Date.now(), port: 5174 });
+  const selfData = selfSeal.data as { taskName: string; taskSource: string; briefPath: string; bridge: { latest: string } };
+  check("Agent 零输入自封存：任务名来自推断，简报路径与接入结果都回得来",
+    !!selfData.taskName && selfData.taskName !== "未命名任务" && !!selfData.briefPath
+    && selfData.bridge.latest === "updated", JSON.stringify(selfData).slice(0, 200));
+  let noConfirmCode = "";
+  try { await executeAgentTool("acb.handoff_create", { projectId: regJ.config.projectId }, { bootedAt: Date.now(), port: 5174 }); }
+  catch (e) { noConfirmCode = (e as { code?: string }).code ?? ""; }
+  check("自封存仍然要 confirm:true（写项目这件事不由工具替人决定）", noConfirmCode === "confirm_required", noConfirmCode);
+
+  // 还原出来的目录同样自读
+  const targetJ = path.join(T, "repoBridge-target");
+  const resJ = await performResume({ projectId: regJ.config.projectId, targetDir: targetJ });
+  const latestT = await readOr(path.join(targetJ, ".acb", "LATEST.md"));
+  const agentsT = await readOr(path.join(targetJ, "AGENTS.md"));
+  check("还原出来的目录里接入块到位（随包带过来，指针是新建的）",
+    resJ.bridge !== null && resJ.bridge.agents === "unchanged" && resJ.bridge.latest === "created"
+    && agentsT.includes("ACB:BEGIN") && latestT.includes("ACB-HANDOFF.md"),
+    JSON.stringify(resJ.bridge));
+  check("还原指针里的完整性数字就是实测的那条，且教它先注册再自封存",
+    latestT.includes(`实测逐条 SHA-256 通过 ${resJ.report.verifiedCount} 条`)
+    && latestT.includes("register \"" + targetJ + "\"")
+    && latestT.includes("create <新的 prj_")
+    && !latestT.includes("「封存」那一节"), latestT.slice(0, 300));
+
+  // ========== 7.17 接手接口：一次调用拿到摘要，而且必须比"直接丢简报"省 token ==========
+  // 判据是用户给的那条：接口不省 token 就没意义。所以这里不只测"能返回"，
+  // 而是把两边成本放进同一次断言里 —— 摘要变胖了，这条就红。
+  type TakeoverOut = {
+    via: string; level: string; hnd: string; task: string; proj: string; path: string; n: number;
+    files: { p: string; s: string }[]; more: number; next: string[]; need: string[]; checks: unknown[];
+    seal: string | null; brief: string; markdown?: string; tokens?: number;
+    cost?: { tokens: number; briefTokens: number };
+  };
+  const asTk = (o: Record<string, unknown>) => o as unknown as TakeoverOut;
+  const latestI = (await loadHandoffRecords(repoI))[0];
+  const tko = asTk(await takeover({ at: path.join(repoI, "src", "auth") }));
+  check("at=<子目录> 就能问出该接哪一条（Agent 只知道自己在哪儿）",
+    tko.via === "at" && tko.hnd === latestI.handoffId && tko.proj === "infer-repo", JSON.stringify(tko).slice(0, 160));
+  check("摘要带着动手要用的四件事：任务 / 文件 / 下一步 / 需本机补齐",
+    !!tko.task && Array.isArray(tko.files) && tko.files.length > 0 && Array.isArray(tko.next) && Array.isArray(tko.need));
+  check("摘要自报两边成本，且确实比简报原文省",
+    !!tko.cost && tko.cost.tokens > 0 && tko.cost.tokens < tko.cost.briefTokens, JSON.stringify(tko.cost));
+  const tkf = asTk(await takeover({ projectId: "prj_infer", level: "files" }));
+  check("files 档只回文件清单，条数等于改动数（不悄悄砍）",
+    tkf.files.length === tkf.n && tkf.n === latestI.state.changes.length, `${tkf.files.length}/${tkf.n}`);
+  const tkb = asTk(await takeover({ handoffId: latestI.handoffId, level: "brief" }));
+  check("brief 档回的是那份简报原文，不是二手摘要",
+    !!tkb.markdown && tkb.markdown.startsWith("# 接手简报")
+    && tkb.markdown === await fs.readFile(path.join(latestI.packageDir, "HANDOFF.md"), "utf8"));
+  check("brief 档把原文成本如实算出来（丢文件这条路值多少）",
+    (tkb.tokens ?? 0) > 0 && estimateTokens(tkb.markdown ?? "") === tkb.tokens);
+  check("摘要里连自己封存的命令都给（读完就知道下一步怎么收尾）",
+    !!tko.seal && tko.seal.includes("create prj_infer"), String(tko.seal));
+  let amb = "";
+  try { await takeover({}); } catch (e) { amb = e instanceof Error ? e.message : String(e); }
+  check("没说过在哪、接哪条：要参数而不是猜一条", /at=|projectId=|handoffId=/.test(amb) && amb.includes("出路"), amb.slice(0, 160));
+  let noAt = "";
+  try { await takeover({ at: path.join(T, "没注册过的目录") }); } catch (e) { noAt = e instanceof Error ? e.message : String(e); }
+  check("未注册目录：说得出没注册，并把可选项列出来", noAt.includes("不属于任何已注册项目") && noAt.includes("prj_"), noAt.slice(0, 160));
+  let noHnd = "";
+  try { await takeover({ projectId: "prj_gone2" }); } catch (e) { noHnd = e instanceof Error ? e.message : String(e); }
+  check("未注册项目这条也给出路（project_register / 直接传 at）", noHnd.includes("出路"), noHnd.slice(0, 160));
 
   // ========== 8. 损坏包被阻止 ==========
-  await fs.writeFile(archive, Buffer.from("corrupted!!"));
+  const brokenPkg = path.join(T, "broken-pkg");
+  await fs.cp(rec.packageDir, brokenPkg, { recursive: true });
+  await fs.writeFile(path.join(brokenPkg, "manifest.json"), Buffer.from("corrupted!!"));
   let blocked = false;
+  let blockedWhy = "";
   try {
-    await resumeFromArchive({ filePath: archive, handoffId: rec.handoffId, targetDir: path.join(T, "repoD"), source: archive });
-  } catch { blocked = true; }
-  check("损坏包在写入目标前被阻止", blocked || !(await fs.access(path.join(T, "repoD", "src")).then(() => true).catch(() => false)));
+    await restorePackage({ packageDir: brokenPkg, targetDir: path.join(T, "repoD"), source: "损坏副本" });
+  } catch (e) { blocked = true; blockedWhy = String((e as Error).message); }
+  check("损坏包在写入目标前被阻止", blocked
+    && (await fs.readdir(path.join(T, "repoD")).then((f) => f.length).catch(() => 0)) === 0, blockedWhy);
+  check("损坏包说得出是包结构读不出来", /结构不完整/.test(blockedWhy), blockedWhy);
 
   // ========== 9. 恢复报告落盘 ==========
   const reports = await loadResumeReports();
@@ -493,7 +714,7 @@ async function main() {
   try {
     const health = await fetch(`${base}/api/health`);
     const hb = await health.json() as { ok?: boolean; data?: { tools?: number } };
-    check("GET /api/health 通，且报的是工具注册表的真数", health.status === 200 && hb.ok === true && (hb.data?.tools ?? 0) >= 17, `tools=${hb.data?.tools}`);
+    check("GET /api/health 通，且报的是工具注册表的真数", health.status === 200 && hb.ok === true && (hb.data?.tools ?? 0) === AGENT_TOOLS.length, `tools=${hb.data?.tools}`);
     check("响应不带 CORS 放行头（这个服务没有跨源调用方）", health.headers.get("access-control-allow-origin") === null);
     check("外来 Origin 403", (await fetch(`${base}/api/health`, { headers: { origin: "https://evil.example.com" } })).status === 403);
     check("登记过的回环开发源（vite:5173）放行", (await fetch(`${base}/api/health`, { headers: { origin: "http://localhost:5173" } })).status === 200);
@@ -509,7 +730,37 @@ async function main() {
 
     const manifest = await fetch(`${base}/api/agent/manifest`);
     const mb = await manifest.json() as { data?: { tools?: { name: string }[] } };
-    check("/api/agent/manifest 交出工具表", manifest.status === 200 && (mb.data?.tools?.length ?? 0) >= 17 && mb.data!.tools!.some((t) => t.name === "acb.project_overview"));
+    check("/api/agent/manifest 交出工具表", manifest.status === 200 && (mb.data?.tools?.length ?? 0) === AGENT_TOOLS.length && mb.data!.tools!.some((t) => t.name === "acb.handoff_takeover"));
+    const toolNames = (mb.data?.tools ?? []).map((x) => x.name);
+    check("跨电脑工具已从能力面撤下（发布与远端列表都不再暴露）",
+      !toolNames.some((x) => /publish|remote/i.test(x)), toolNames.join(","));
+    // ---------- 接手接口：REST / Agent 工具 / MCP 桥三条入口，同一份判据 ----------
+    const restTk = await (await fetch(`${base}/api/handoff-brief?at=${encodeURIComponent(repoI)}`)).json();
+    const toolTk = await executeAgentTool("acb.handoff_takeover", { at: repoI }, { bootedAt: Date.now(), port: handle.port });
+    check("REST 与 Agent 工具回的是同一份接手摘要（判据只有一处）",
+      JSON.stringify(restTk) === JSON.stringify(toolTk.data), JSON.stringify(restTk).slice(0, 120));
+    const txt = await fetch(`${base}/api/handoff-brief?handoffId=${restTk.hnd}&level=brief&format=text`);
+    const txtBody = await txt.text();
+    check("format=text 回纯简报，连 JSON 壳都不留",
+      (txt.headers.get("content-type") ?? "").includes("text/markdown") && txtBody.startsWith("# 接手简报"));
+    const noArg = await fetch(`${base}/api/handoff-brief`);
+    const goneProj = await fetch(`${base}/api/handoff-brief?projectId=prj_没这个项目`);
+    check("接手端点分类：缺参数 400、找不到 404（不是 500）",
+      noArg.status === 400 && goneProj.status === 404, `${noArg.status}/${goneProj.status}`);
+    const ep = await readEndpoint();
+    check("发现文件写的是这次真实监听的端口（桌面版随机端口也找得到）",
+      ep?.port === handle.port && ep?.base_url === base && ep?.pid === process.pid, JSON.stringify(ep));
+    const lean = await mcpProbe(handle.port, repoI, ["handoff_takeover", "handoff_create"]);
+    const full = await mcpProbe(handle.port, repoI, []);
+    check("MCP 桥按 ACB_MCP_TOOLS 只登记要用的两条（工具表也要进上下文）",
+      lean.toolNames.length === 2 && lean.toolNames[0] === "acb.handoff_takeover"
+      && full.toolNames.length === AGENT_TOOLS.length, JSON.stringify(lean.toolNames));
+    check("MCP tools/call 回紧凑 JSON（缩进给人看，模型侧白烧 token）",
+      lean.callText.startsWith("{") && !lean.callText.includes("\n  ")
+      && JSON.parse(lean.callText).hnd === restTk.hnd, lean.callText.slice(0, 120));
+    check("全量工具表确实比精简版贵（所以要收窄，别口头说省）",
+      full.listChars > lean.listChars * 4, `${full.listChars}/${lean.listChars}`);
+
     // 调用形状是 {tool, input}（见 server/agent/routes.ts 的 POST /api/agent/tool）
     const unknown = await fetch(`${base}/api/agent/tool`, {
       method: "POST", headers: { "content-type": "application/json" },
@@ -517,7 +768,7 @@ async function main() {
     });
     const ub = await unknown.json() as { error?: { code?: string; available?: string[] } };
     check("未知工具是 400+unknown_tool，不是 500", unknown.status === 400 && ub.error?.code === "unknown_tool", `${unknown.status} ${ub.error?.code}`);
-    check("unknown_tool 带机器可读的可用清单", Array.isArray(ub.error?.available) && (ub.error?.available?.length ?? 0) >= 17);
+    check("unknown_tool 带机器可读的可用清单", Array.isArray(ub.error?.available) && (ub.error?.available?.length ?? 0) === AGENT_TOOLS.length);
 
     // 注册还在、目录被挪走：调用方能自己修好的失败 → 404 并点名是哪个路径。
     // 报 500 的话，Agent 会以为服务坏了去重试，而重试一万次也不会好。
@@ -544,6 +795,7 @@ async function main() {
     check("Agent 侧那条也带着路径与出路", (prevBody.error?.message ?? "").includes(gone), (prevBody.error?.message ?? "").slice(0, 70));
   } finally {
     await handle.close();
+    check("服务关完后发现文件收回（不留一个连不上的地址冒充在线）", (await readEndpoint()) === null);
   }
 
   console.log(`\n结果: ${pass} 通过, ${fail} 失败`);

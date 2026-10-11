@@ -6,9 +6,9 @@ contextBridge.exposeInMainWorld("acb", {
   // （darwin 用系统红绿灯，win32/linux 无边框 + 界面内三键）
   platform: process.platform,
   pickFolder: () => ipcRenderer.invoke("acb:pick-folder"),
-  pickArchive: () => ipcRenderer.invoke("acb:pick-archive"),
   // 拖放的 File 对象转本机真实路径（Electron ≥32 移除了 File.path，官方推荐 webUtils）
   getPathForFile: (file) => webUtils.getPathForFile(file),
+  openPath: (p) => ipcRenderer.invoke("acb:open-path", p),
   // 自绘标题栏的窗口三键（frameless 窗口用）
   windowControls: {
     minimize: () => ipcRenderer.invoke("acb:window-minimize"),

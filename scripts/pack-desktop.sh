@@ -5,6 +5,21 @@ set -e
 cd "$(dirname "$0")/.."
 # 版本只有一个来源：package.json。之前这里写死 0.1.0、而 package.json 是 0.0.0，
 # 于是双击的 exe 报 0.1.0、服务与界面报 0.0.0（npm run verify 会抓到这件事）。
+# 先确认没有在跑的 ACB.exe：Windows 会锁住 release 目录，rm -rf 半途失败会留下一个残缺的发行包
+if tasklist 2>/dev/null | grep -qi "^ACB.exe"; then
+  echo "ACB.exe 正在运行：先关掉它再打包（Windows 锁住 releaseACB-win64，删不干净会留下残缺包）。" >&2
+  exit 1
+fi
+
+# Electron 运行时不在 npm install 里（postinstall 被跳过时 node_modules/electron/dist 就是空的），
+# 少了它 cp -r 会把发行目录删成半成品，所以先检查再动手，并给出可直接照抄的修复命令。
+if [ ! -f node_modules/electron/dist/electron.exe ]; then
+  echo "缺 Electron 运行时（node_modules/electron/dist）。执行：
+  HTTPS_PROXY=http://127.0.0.1:7897 node node_modules/electron/install.js
+（github 直连在本机被墙，要走本地代理）" >&2
+  exit 1
+fi
+
 VER=$(node -p "require('./package.json').version")
 npm run build
 npx tsc -p tsconfig.server.json
@@ -28,7 +43,7 @@ cp desktop/main.cjs desktop/preload.cjs release/app/server.cjs release/app/cli.c
 cp build/icon.ico build/icon-256.png release/ACB-win64/resources/app/
 cp -r dist release/ACB-win64/resources/app/dist
 printf '{ "name": "acb", "productName": "ACB", "version": "%s", "main": "main.cjs" }' "$VER" > release/ACB-win64/resources/app/package.json
-cp README-DESKTOP.txt release/ACB-win64/使用说明.txt 2>/dev/null || true
+cp 使用说明.txt release/ACB-win64/使用说明.txt 2>/dev/null || true
 
 # 4. 精简：删除默认应用与多余语言包（保留 zh-CN / en-US）
 rm -f release/ACB-win64/resources/default_app.asar

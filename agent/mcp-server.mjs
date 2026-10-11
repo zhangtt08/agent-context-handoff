@@ -9,6 +9,7 @@
 //      否则会被 server/core/local-guard.ts 判 403。桥把同一个环境变量透传过去，不新存一份。
 import { spawn } from 'node:child_process';
 import { readFileSync, existsSync } from 'node:fs';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -33,6 +34,23 @@ function endpointFile() {
   return existsSync(p) ? readFileSync(p, 'utf8').trim() : null;
 }
 
+/**
+ * ~/.acb/endpoint.json 是打包版（随机端口、没有 agent/ 目录）唯一的发现途径。
+ * 读出来可能已经陈旧（那个进程早退了），所以 ensureBase 仍然逐个探 /api/health ——
+ * 探不通就换下一个候选，陈旧条目不会把人带错地方。
+ */
+function endpointJson() {
+  try {
+    const home = process.env.ACB_HOME || os.homedir();
+    const p = path.join(home, '.acb', 'endpoint.json');
+    if (!existsSync(p)) return null;
+    const j = JSON.parse(readFileSync(p, 'utf8'));
+    return typeof j.base_url === 'string' ? j.base_url.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 function headers(withBody) {
   const h = withBody ? { 'content-type': 'application/json' } : {};
   const token = (process.env.ACB_LOCAL_TOKEN ?? '').trim();
@@ -54,7 +72,7 @@ async function rpc(base, method, params) {
 }
 
 async function ensureBase() {
-  const candidates = [process.env.AGENT_BASE_URL, endpointFile(), process.env.AGENT_DEFAULT_BASE].filter(Boolean);
+  const candidates = [process.env.AGENT_BASE_URL, endpointFile(), endpointJson(), process.env.AGENT_DEFAULT_BASE].filter(Boolean);
   for (const base of candidates) {
     try {
       const r = await fetch(`${base}/api/health`, { signal: AbortSignal.timeout(1500) });
@@ -98,13 +116,21 @@ async function handle(req) {
   if (method === 'tools/list') {
     BASE = BASE || await ensureBase();
     const body = await rpc(BASE, 'tools/list');
-    return msg(id, { tools: body.data.map((t) => ({ name: t.name, description: t.description, inputSchema: t.input_schema, annotations: { readOnlyHint: t.risk === 'read', destructiveHint: false, openWorldHint: false } })) });
+    // 工具表本身是要进模型上下文的一次性开销：16 条中文描述全塞进去，比"直接丢一份简报文件"
+    // 还贵，那这条接口就没意义了。ACB_MCP_TOOLS 只登记需要的几条（逗号分隔，可省 acb. 前缀）。
+    const only = (process.env.ACB_MCP_TOOLS ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+    const keep = only.length
+      ? body.data.filter((t) => only.some((want) => t.name === want || t.name === `acb.${want}`))
+      : body.data;
+    return msg(id, { tools: keep.map((t) => ({ name: t.name, description: t.description, inputSchema: t.input_schema, annotations: { readOnlyHint: t.risk === 'read', destructiveHint: false, openWorldHint: false } })) });
   }
   if (method === 'tools/call') {
     BASE = BASE || await ensureBase();
     try {
       const body = await rpc(BASE, 'tools/call', { tool: params.name, input: params.arguments || {} });
-      return msg(id, { content: [{ type: 'text', text: JSON.stringify(body.data, null, 2) }], isError: false });
+      // 默认紧凑 JSON：缩进给人看，但这里是给模型读的，两空格缩进能多烧掉两三成 token。
+      const text = process.env.ACB_MCP_PRETTY ? JSON.stringify(body.data, null, 2) : JSON.stringify(body.data);
+      return msg(id, { content: [{ type: 'text', text }], isError: false });
     } catch (e) {
       return msg(id, { content: [{ type: 'text', text: `调用失败：${e.message}` }], isError: true });
     }

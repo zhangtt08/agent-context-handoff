@@ -1,6 +1,6 @@
 # ACB · Agent API（personal-agent-hub 标准 v1，就地接入形状 B）
 
-ACB 把自己**现有**的 Express 服务（默认 `127.0.0.1:5174`）直接实现成带 schema 的工具面：
+ACB 把自己**现有**的 Express 服务（默认 `127.0.0.1:5174`）直接实现成带 schema 的工具面（只做本机交接，不含跨机传输工具）：
 没有第二个进程、没有第二个端口、没有第二份实现。
 
 ```
@@ -36,27 +36,57 @@ node agent/tools.mjs --selftest      # 逐个真跑只读工具，确认返回�
 状态码：入参错、未知工具（带 `error.available` 数组）、需要确认、找不到 → **400**；
 只有服务内部故障才是 **500**。四个端点都注册在 SPA 兜底之前，拼错的 `/api/agent/*` 也回 JSON 而不是 HTML。
 
-## 工具清单（17 个，全部 `acb.` 前缀）
+## 怎么被找到（端口不靠猜）
+
+候选顺序：`AGENT_BASE_URL` → `agent/.endpoint` → `~/.acb/endpoint.json` → `AGENT_DEFAULT_BASE`(5174)，
+每个都探一次 `/api/health`，探不通就换下一个。第三份是服务端每次 listen 后写的
+（`pid` / `port` / `base_url` / `started_at` / `version`），**桌面版跑随机端口时只有这一条路**；
+服务正常关闭时按 pid 收回，不会留一个连不上的地址冒充在线。
+
+## MCP 侧的两个开关（因为工具表本身要进上下文）
+
+- `ACB_MCP_TOOLS=handoff_takeover`：`tools/list` 只登记列出的这几条（可省 `acb.` 前缀）。
+  16 条全挂的一次性工具表实测 3319 tokens，比直接把简报丢给 Agent 还贵 —— 这条接口就不该那样用。
+  接手角色登记 1 条（表 233 tokens），要它同时能自己收尾再加 `handoff_create`。
+- `ACB_MCP_PRETTY=1`：`tools/call` 默认回**紧凑** JSON（缩进是给人看的，模型侧白烧 token）。
+
+成本可复算：仓库根跑 `npm run tokens`（同一把尺子对比"丢文件"与"调接口"，不省就红着退出）。
+
+## 直接走 HTTP 的接法（没有 MCP 也行）
+
+```
+GET /api/handoff-brief?at=D%3A%5Cdev%5Cmy-project            # 摘要（默认）
+GET /api/handoff-brief?projectId=prj_x&level=files           # 只要文件清单
+GET /api/handoff-brief?handoffId=hnd_x&level=brief&format=text  # 简报原文，纯文本
+```
+令牌：`GET /api/handoff-brief` 属于只读方法，设了 `ACB_LOCAL_TOKEN` 也不需要带；
+一旦设了令牌，所有非只读请求（含 `POST /api/agent/tool`，封存/恢复都走这一条）必须带
+`x-acb-token`，MCP 桥与 `agent/tools.mjs` 会把同一个环境变量透传过去（见 `server/core/local-guard.ts`）。
+
+## 工具清单（16 个，全部 `acb.` 前缀）
 
 只读（10）——不写任何字节：
 
 | 名称 | 真实能力 |
 | --- | --- |
+| `acb.handoff_takeover` | **接手第一条该调的**：`at=<工作目录>`（或 projectId / handoffId）→ 任务、该看哪几个文件、下一步、检查结论、需本机补齐的材料，外加 `cost`（本次摘要 vs 简报原文的 token 估算）。`level=summary\|files\|brief` |
 | `acb.storage_status` | 注册表/报告路径、绑定地址与端口、是否要令牌、存储层坏文件警告（`server/core/store.ts`） |
 | `acb.projects_list` | `~/.acb/projects.json` |
 | `acb.project_overview` | 与总览页同一份 `server/core/overview.ts`（git status + 任务分组 + 分叉判定） |
 | `acb.handoffs_list` | `<project>/.acb/store/handoffs/*/record.json` |
-| `acb.handoff_detail` | 单条交接的 state/验证/发布回执/子交接 |
+| `acb.handoff_detail` | 单条交接的 state / 观测 / 验证记录 / 声明 / 子交接 / 包目录 |
 | `acb.handoff_integrity` | `verifyPackage()`：逐条目实测 SHA-256 |
 | `acb.handoff_preview` | `buildPreview()`：打包前审阅清单（含排除原因、阻塞项） |
 | `acb.resume_reports` | `~/.acb/resume-reports.json` |
-| `acb.remote_handoffs` | `git ls-remote` + 取回远端元数据（只读对象，不动本地分支） |
 | `acb.job_status` | 异步封存/恢复作业的进度表 |
 
-写入（2）：`acb.project_register`（write）、`acb.project_config_save`（write，带 `checks` 时要 `confirm`，
+写入（2）：`acb.project_register`（write；除注册表条目外还在项目里写 `.acb/LATEST.md` 指针与
+`AGENTS.md` 里那段 ACB 接入块 —— 项目里先建一个空文件 `.acb/NO-BRIDGE` 就不会碰 AGENTS.md）、
+`acb.project_config_save`（write，带 `checks` 时要 `confirm`，
 因为写进去的是**以后会被执行的命令**）。
 
-执行（3）：`acb.handoff_create`、`acb.handoff_publish`、`acb.resume_restore`（destructive）。
+执行（2）：`acb.handoff_create`（`taskName` 可以留空，留空即用 ACB 从分支名/提交标题/diff 推断出来的那句 ——
+被换掉之前自己交接的那个 Agent 不该被迫现编一句人类文案）、`acb.resume_restore`（destructive）。
 移除（1）：`acb.project_remove`（destructive，只动注册表条目，不删盘上任何东西）。
 
 `risk` 为 `exec` / `destructive` 的工具在 `confirm !== true` 时一律拒绝，返回

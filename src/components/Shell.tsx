@@ -1,11 +1,6 @@
-import { NavLink, useLocation } from "react-router-dom";
 import { useEffect, useState, type ReactNode } from "react";
-import {
-  LayoutDashboard, Package, CloudUpload, MonitorDown, Settings2,
-  HardDrive, Sun, Moon, GitBranchPlus, Minus, Square, Copy, X,
-} from "lucide-react";
-import { useProject } from "../state";
-import { api, pathFromDrop, windowControls, desktopPlatform } from "../api";
+import { Minus, Square, Copy, X, Sun, Moon, TriangleAlert, Info, Check } from "lucide-react";
+import { windowControls, desktopPlatform, copyText, pathFromDrop, type PreviewAlert } from "../api";
 
 /** 拖放区：拖入文件后回调本机路径（桌面版）；拖悬时显示遮罩提示 */
 export function DropArea({ onPath, hint, children }: { onPath: (p: string | null) => void; hint: string; children: ReactNode }) {
@@ -23,51 +18,6 @@ export function DropArea({ onPath, hint, children }: { onPath: (p: string | null
   );
 }
 
-export function Rail({ theme, onToggleTheme }: { theme: "light" | "dark"; onToggleTheme: () => void }) {
-  const { active } = useProject();
-  const [latestHandoff, setLatestHandoff] = useState<string | null>(null);
-
-  // 侧边栏「交接详情」指向当前项目最新交接；无项目/无交接时回到总览
-  useEffect(() => {
-    let cancelled = false;
-    setLatestHandoff(null);
-    if (!active) return;
-    void api.overview(active.projectId).then((o) => {
-      if (!cancelled) setLatestHandoff(o.handoffs[0]?.handoffId ?? null);
-    }).catch(() => { /* 总览不可用时维持回退链接 */ });
-    return () => { cancelled = true; };
-  }, [active?.projectId, active?.githubRemote]);
-
-  const detailTo = latestHandoff ? `/handoff/${latestHandoff}` : "/";
-
-  return (
-    <aside className="rail">
-      <div className="logo" onClick={() => location.assign("#/")}>ACB</div>
-      <NavLink to="/" end className={({ isActive }) => "nav" + (isActive ? " active" : "")} title="项目总览">
-        <LayoutDashboard size={17} />
-      </NavLink>
-      <NavLink to={detailTo} className={({ isActive }) => "nav" + (isActive ? " active" : "")} title={latestHandoff ? "交接详情（最新）" : "交接详情（暂无交接）"}>
-        <Package size={17} />
-      </NavLink>
-      <NavLink to="/create" className={({ isActive }) => "nav" + (isActive ? " active" : "")} title="审阅清单并打包交接">
-        <CloudUpload size={17} />
-      </NavLink>
-      <NavLink to="/resume" className={({ isActive }) => "nav" + (isActive ? " active" : "")} title="预览差异并还原">
-        <MonitorDown size={17} />
-      </NavLink>
-      <NavLink to="/settings" className={({ isActive }) => "nav" + (isActive ? " active" : "")} title="项目设置（GitHub 远端 / 检查命令）">
-        <Settings2 size={17} />
-      </NavLink>
-      <div className="spacer" />
-      <div className="rail-tag">LOCAL · NO CLOUD MIDDLEMAN</div>
-      <button className="theme-toggle" onClick={onToggleTheme} title="切换主题">
-        {theme === "light" ? <Moon size={16} /> : <Sun size={16} />}
-      </button>
-    </aside>
-  );
-}
-
-/** 窗口三键：最小化/最大化(还原)/关闭。仅在 Electron 无边框窗口（Windows/Linux）中渲染 */
 function WindowControls() {
   const controls = windowControls();
   const platform = desktopPlatform();
@@ -76,12 +26,11 @@ function WindowControls() {
   useEffect(() => {
     if (!controls) return;
     let alive = true;
-    void controls.isMaximized().then((v) => { if (alive) setMaximized(v); }).catch(() => { /* 降级为默认图标 */ });
+    void controls.isMaximized().then((v) => { if (alive) setMaximized(v); }).catch(() => {});
     const unsubscribe = controls.onMaximizedChange(setMaximized);
     return () => { alive = false; unsubscribe(); };
   }, [controls]);
 
-  // 判据来自桌面壳告知的真实平台：macOS 保留系统红绿灯（主进程 frame:true），其余自绘
   if (!controls || platform === "darwin") return null;
 
   return (
@@ -89,12 +38,7 @@ function WindowControls() {
       <button type="button" className="win-btn" title="最小化" onClick={() => void controls.minimize().catch(() => {})}>
         <Minus size={15} />
       </button>
-      <button
-        type="button"
-        className="win-btn"
-        title={maximized ? "向下还原" : "最大化"}
-        onClick={() => void controls.toggleMaximize().catch(() => {})}
-      >
+      <button type="button" className="win-btn" title={maximized ? "向下还原" : "最大化"} onClick={() => void controls.toggleMaximize().catch(() => {})}>
         {maximized ? <Copy size={13} /> : <Square size={12} />}
       </button>
       <button type="button" className="win-btn close" title="关闭" onClick={() => void controls.close().catch(() => {})}>
@@ -104,77 +48,113 @@ function WindowControls() {
   );
 }
 
-export function Topbar({ path, actions }: { path: string[]; actions?: ReactNode }) {
-  // frameless 窗口：topbar 即标题栏，双击空白处切换最大化（双击按钮等控件时不触发）
+/** 页眉：整页唯一的导航位 —— 项目选择 + 换项目/管理 + 主题 + 窗口三键 */
+export function Topbar({ children, actions }: { children: ReactNode; actions?: ReactNode }) {
+  const [theme, setTheme] = useState<"light" | "dark">(() =>
+    localStorage.getItem("acb-theme") === "dark" ? "dark" : "light");
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("acb-theme", theme);
+  }, [theme]);
+
   const onDoubleClick = (e: React.MouseEvent<HTMLElement>) => {
     if ((e.target as HTMLElement).closest("button, a, input, select")) return;
     void windowControls()?.toggleMaximize().catch(() => {});
   };
+
   return (
     <header className="topbar" onDoubleClick={onDoubleClick}>
-      <div className="crumb">
-        <HardDrive size={14} />
-        {path.map((seg, i) => (
-          <span key={i} style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            {i > 0 && <span className="sep">/</span>}
-            {i === path.length - 1 ? <b>{seg}</b> : <span>{seg}</span>}
-          </span>
-        ))}
-      </div>
+      <div className="logo-mark">ACB</div>
+      <div className="crumb">{children}</div>
       <div className="right">
         {actions}
-        <NavCreateButton />
+        <button className="icon-btn" title={theme === "light" ? "切换暗色" : "切换亮色"} onClick={() => setTheme(theme === "light" ? "dark" : "light")}>
+          {theme === "light" ? <Moon size={15} /> : <Sun size={15} />}
+        </button>
       </div>
       <WindowControls />
     </header>
   );
 }
 
-function NavCreateButton() {
-  const loc = useLocation();
-  if (loc.pathname.startsWith("/create")) return null;
+export function Panel({ title, step, hint, corner, children, headExtra, style }: {
+  title: ReactNode; step?: string; hint?: ReactNode; corner?: boolean;
+  children: ReactNode; headExtra?: ReactNode; style?: React.CSSProperties;
+}) {
   return (
-    <button className="btn primary sm" onClick={() => location.assign("#/create")}>
-      <GitBranchPlus size={14} /> 创建交接
-    </button>
+    <section className={"panel" + (corner ? " cornered" : "")} style={style}>
+      <div className="panel-head">
+        {step && <span className="step-no">{step}</span>}
+        <h3>{title}</h3>
+        {headExtra}
+        {hint && <span className="head-hint">{hint}</span>}
+      </div>
+      <div className="panel-body">{children}</div>
+    </section>
   );
 }
 
-export function PageHead({ kicker, title, monoId, sub }: { kicker: string; title: string; monoId?: string; sub?: ReactNode }) {
+/** 折叠块：默认收起，标题上就给出内容量，不让人靠点开找 */
+export function Disclosure({ label, count, open, onToggle, tone, children }: {
+  label: ReactNode; count?: ReactNode; open: boolean; onToggle: () => void;
+  tone?: string; children: ReactNode;
+}) {
   return (
-    <div className="page-head">
-      <div>
-        <div className="kicker">{kicker}</div>
-        <h1>
-          {title}
-          {monoId && <span className="mono-id"> {monoId}</span>}
-        </h1>
-      </div>
-      {sub && <p className="sub">{sub}</p>}
+    <div className={"disc " + (open ? "open" : "")}>
+      <button type="button" className="disc-head" onClick={onToggle}>
+        <span className={"disc-caret" + (open ? " up" : "")}>▸</span>
+        <span className="disc-label">{label}</span>
+        {count !== undefined && <span className={"badge " + (tone ?? "")}>{count}</span>}
+      </button>
+      {open && <div className="disc-body">{children}</div>}
     </div>
   );
 }
 
-export function Panel({ title, icon, tag, corner, children, headExtra, style, bodyStyle }: {
-  title: ReactNode;
-  icon?: ReactNode;
-  tag?: string;
-  corner?: boolean;
-  children: ReactNode;
-  headExtra?: ReactNode;
-  style?: React.CSSProperties;
-  bodyStyle?: React.CSSProperties;
-}) {
+export function AlertCard({ a }: { a: PreviewAlert }) {
+  const tone = a.level === "阻塞" ? "block" : a.level === "警告" ? "warn" : "info";
   return (
-    <section className="panel" style={style}>
-      {corner && <div className="corner" />}
-      <div className="panel-head">
-        {icon}
-        <h3>{title}</h3>
-        {headExtra}
-        {tag && <span className="tag">{tag}</span>}
-      </div>
-      <div className="panel-body" style={bodyStyle}>{children}</div>
-    </section>
+    <div className={"alert " + tone}>
+      <h6>
+        {a.level === "提示" ? <Info size={14} className="teal" /> : <TriangleAlert size={14} className={a.level === "阻塞" ? "red" : "amber"} />}
+        {a.title}
+        <span className={"badge " + (a.level === "阻塞" ? "red" : a.level === "警告" ? "amber" : "teal")} style={{ marginLeft: "auto" }}>{a.level}</span>
+      </h6>
+      <div className="d">{a.detail}</div>
+      <div className="a"><b>出路</b> {a.action}</div>
+    </div>
+  );
+}
+
+/** 复制按钮：一键给出成功/失败，且复制的内容本身可见 */
+export function CopyButton({ text, label = "复制", sm = true }: { text: string; label?: string; sm?: boolean }) {
+  const [done, setDone] = useState<string | null>(null);
+  return (
+    <button
+      className={"btn " + (sm ? "sm " : "") + (done === "已复制" ? "ok" : "ghost")}
+      onClick={() => void copyText(text).then((r) => {
+        setDone(r);
+        setTimeout(() => setDone(null), 2600);
+      })}
+    >
+      {done === "已复制" ? <><Check size={13} className="green" /> 已复制</>
+        : done ? <><TriangleAlert size={13} className="red" /> {done}</>
+        : <><Copy size={13} /> {label}</>}
+    </button>
+  );
+}
+
+/** 打开本机文件/目录：桌面版才有，浏览器端整块不渲染 */
+export function OpenLink({ path, label }: { path: string; label: string }) {
+  const [err, setErr] = useState<string | null>(null);
+  if (!window.acb?.openPath) return null;
+  return (
+    <span style={{ display: "inline-flex", gap: 6, alignItems: "center" }}>
+      <button className="btn sm ghost" title={path}
+        onClick={() => void window.acb!.openPath!(path).then((r) => { if (r && r !== "ok") setErr(r); }).catch((e: Error) => setErr(e.message))}>
+        {label}
+      </button>
+      {err && <span className="xs red">{err}</span>}
+    </span>
   );
 }

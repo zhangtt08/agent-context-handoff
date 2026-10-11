@@ -1,8 +1,6 @@
 // ACB 共享协议类型 —— 前后端共用（对齐 docs/PROTOCOL-OUTLINE.md v0.1）
 
 export type VerifyResult = "通过" | "失败" | "未执行" | "超时" | "执行器错误";
-export type PublishTarget = "github" | "local";
-export type PublishState = "未发布" | "发布中" | "已发布" | "失败";
 export type ResumeVerdict = "可继续" | "需要配置环境" | "需要重新验证" | "恢复被阻塞";
 
 export interface ProjectConfig {
@@ -11,8 +9,6 @@ export interface ProjectConfig {
   path: string;
   /** 每项为一条 shell 检查命令 */
   checks: { name: string; cmd: string; timeoutMs?: number }[];
-  /** GitHub 远端（可选） */
-  githubRemote?: string;
 }
 
 export interface FileChange {
@@ -83,6 +79,19 @@ export interface ProjectState {
    * 0.1 增补字段，旧包没有这一项，接收端一律按 ?? [] 读。
    */
   emptyDirs?: string[];
+  /**
+   * 自动推断出来的交接内容（分支名 / 提交标题 / diff 新增符号 / TODO / 未同步测试）。
+   * 人不必手写任务与现状；这些是工具算出来的，简报里标"推断"，不混进观测也不冒充声明。
+   */
+  inferred?: {
+    taskSource: string;
+    progress: string[];
+    nextSteps: string[];
+    agentNotePath?: string;
+    /** 只有 ACB 接入块的 AGENTS.md / CLAUDE.md：工具的脚印，不是这次的改动 */
+    acbOwnEdits?: string[];
+    sources: string[];
+  };
 }
 
 export interface PackageManifest {
@@ -95,29 +104,13 @@ export interface PackageManifest {
   requiredCapabilities: string[];
 }
 
-export interface PublicationReceipt {
-  target: PublishTarget;
-  state: PublishState;
-  location: string;           // 仓库/分支 或 文件路径
-  commitSha?: string;         // 传输回执
-  readBackConfirmed: boolean;
-  attempts: number;
-  publishedAt: string;
-  error?: string;
-  /** 本地导出：归档文件自身的 SHA-256 与字节数，供两台电脑逐字核对 */
-  archiveSha256?: string;
-  archiveBytes?: number;
-}
-
 export interface HandoffRecord {
   handoffId: string;
   projectId: string;
   sealedAt: string;
   state: ProjectState;
   manifest: PackageManifest;
-  publications: PublicationReceipt[];
   packageDir: string;
-  archivePath?: string;       // 本地导出文件
 }
 
 export interface ResumeStep {
@@ -150,7 +143,6 @@ export interface ResumeReport {
   entryCount?: number;
   verifiedCount?: number;
   restoredCount?: number;
-  archiveSha256?: string;
   /** 基线物化的实测对账：应写入 / 实际写入 / 被跳过的路径（跳过多于 0 时这一步不算通过） */
   baselineExpected?: number;
   baselineWritten?: number;
@@ -226,6 +218,33 @@ export interface CapturePreview {
   env: { os: string; runtime: string; git: string };
   /** 交接包大致的额外开销：基线 bundle 会携带完整历史 */
   bundleNote: string;
+  /** 自动推断出来的任务与进度（界面据此预填，人可以改，也可以什么都不写） */
+  inferred: {
+    taskName: string;
+    taskSource: string;
+    progress: string[];
+    nextSteps: string[];
+    agentNote?: { path: string; text: string };
+    /** 只有 ACB 接入块的 AGENTS.md / CLAUDE.md：审阅时要单独说明这是工具写的，不是用户的改动 */
+    acbOwnEdits: string[];
+    sources: string[];
+  };
+}
+
+/**
+ * 项目侧接入的结果：这次封存/注册/还原在项目里写了什么。
+ * 界面与 CLI 都要把它说出来 —— "ACB 改了 AGENTS.md" 这种事不能让用户自己发现。
+ */
+export interface BridgeOutcome {
+  agentsFile: string;
+  latestFile: string;
+  /** AGENTS.md 里那段接入块这一次做了什么 */
+  agents: "created" | "appended" | "updated" | "unchanged" | "skipped";
+  /** .acb/LATEST.md 指针页这一次做了什么 */
+  latest: "created" | "updated" | "unchanged";
+  blockLines: number;
+  /** agents=skipped 的原因（项目里有 .acb/NO-BRIDGE，或标记残缺），原样打给用户 */
+  reason?: string;
 }
 
 export interface ResumeConflict {
@@ -258,8 +277,6 @@ export interface ResumePreview {
   conflicts: ResumeConflict[];
   alerts: PreviewAlert[];
   sourceEnv: { os: string; runtime: string };
-  /** 归档体积与摘要说明（本机封存目录时写"无归档摘要"） */
-  archiveInfo?: string;
   /**
    * 只在目标：目标目录里已有、但交接内容（改动 + 基线树）里没有的条目。
    * 还原不会碰它们，但必须让人看见 —— 否则"恢复完成"会被误读成"目录里就是交接内容"。

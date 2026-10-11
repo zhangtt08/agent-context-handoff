@@ -173,6 +173,44 @@ export function reportsPath(): string {
   return REPORTS();
 }
 
+/**
+ * 服务发现文件：外部 Agent 的 MCP 桥 / curl 靠它找到"现在哪个端口上有 ACB 在跑"。
+ * 桌面版是随机端口，没有这一份的话客户端只能猜 5174 —— 于是"agent 直接调 API"这条路在
+ * 双击 exe 的那种用法里根本不通。写随机端口不是问题：**读的一方必须探一次 /api/health**，
+ * 探不通就换下一个候选，所以陈旧条目只会自己被跳过，不会把人带错地方。
+ */
+const ENDPOINT = () => path.join(acbHome(), ".acb", "endpoint.json");
+
+export interface EndpointInfo {
+  base_url: string;
+  host: string;
+  port: number;
+  pid: number;
+  started_at: string;
+  version: string;
+}
+
+export function endpointPath(): string {
+  return ENDPOINT();
+}
+
+export async function publishEndpoint(info: EndpointInfo): Promise<void> {
+  await writeJsonAtomic(ENDPOINT(), info);
+}
+
+/** 只有还是自己写的那一份才删：别把另一个还在跑的实例的发现文件清掉 */
+export async function retractEndpoint(pid: number): Promise<void> {
+  const cur = await readEndpoint();
+  if (!cur || cur.pid !== pid) return;
+  await fs.rm(ENDPOINT(), { force: true }).catch(() => undefined);
+}
+
+export async function readEndpoint(): Promise<EndpointInfo | null> {
+  const { value } = await readJsonSafe<EndpointInfo>(ENDPOINT(), "object");
+  if (!value || typeof value.port !== "number" || typeof value.base_url !== "string") return null;
+  return value;
+}
+
 export async function listProjects(): Promise<ProjectConfig[]> {
   const { value } = await readJsonSafe<ProjectConfig[]>(REGISTRY(), "array");
   return value ?? [];

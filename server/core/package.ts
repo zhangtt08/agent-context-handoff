@@ -2,7 +2,6 @@
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import * as tar from "tar";
 import { HandoffRecord, PackageManifest, ProjectState } from "../../shared/types.js";
 import { sha256Buf, sha256File, ensureDir, sourceDigest, isSafeRelPath, exists } from "./gitutil.js";
 import { renderEntryMarkdown } from "./protocol.js";
@@ -53,7 +52,7 @@ export async function seal(
     }
   }
 
-  // 2.5 基线材料：git bundle 随包携带，接收端可重建 HEAD 历史
+  // 2.5 基线材料：git bundle 随包携带，还原时可重建 HEAD 历史
   if (s.baseline.commit && projectPath) {
     await ensureDir(path.join(pkgDir, "payload"));
     const bundle = path.join(pkgDir, "payload", "baseline.bundle");
@@ -63,7 +62,7 @@ export async function seal(
         void (async () => {
           const written = await exists(bundle);
           if (err && !written) {
-            reject(new Error(`基线历史打包失败：${stderr || err.message}（改动材料已写好；重试仍失败时，可改用「发布到 GitHub 交接分支」路径，它不需要 bundle）`));
+            reject(new Error(`基线历史打包失败：${stderr || err.message}（改动材料已写好；重试仍失败时先确认 git 仓库没被别的进程锁住，或把历史浅化后重试）`));
           } else resolve();
         })();
       });
@@ -78,7 +77,7 @@ export async function seal(
   // 4. Markdown 接手入口（由状态生成）
   const record: HandoffRecord = {
     handoffId: s.handoffId, projectId: s.projectId, sealedAt: s.createdAt,
-    state: s, manifest, publications: [], packageDir: pkgDir,
+    state: s, manifest, packageDir: pkgDir,
   };
   await fs.writeFile(path.join(pkgDir, "HANDOFF.md"), renderEntryMarkdown(record));
 
@@ -149,31 +148,6 @@ export async function checkEntries(pkgDir: string, manifest: PackageManifest): P
     }
   }
   return { ok: broken.length === 0, broken, entryCount: manifest.entries.length, verifiedCount: verified };
-}
-
-export interface ArchiveInfo { path: string; sha256: string; bytes: number }
-
-/**
- * 导出自包含交接文件（含恢复所需全部材料）。
- * 先写 .part 再原子改名，并在导出后重算 SHA-256 —— 半截文件不会顶着一个可用的名字。
- */
-export async function exportArchive(rec: HandoffRecord, outPath: string): Promise<ArchiveInfo> {
-  await ensureDir(path.dirname(outPath));
-  const tmp = outPath + ".part";
-  await fs.rm(tmp, { force: true }).catch(() => {});
-  try {
-    await tar.c(
-      { gzip: true, file: tmp, cwd: path.dirname(rec.packageDir), portable: true },
-      [path.basename(rec.packageDir)],
-    );
-    const info = await sha256File(tmp);
-    const st = await fs.stat(tmp);
-    await fs.rename(tmp, outPath);
-    return { path: outPath, sha256: info, bytes: st.size };
-  } catch (e) {
-    await fs.rm(tmp, { force: true }).catch(() => {});
-    throw e;
-  }
 }
 
 export async function loadRecord(pkgDir: string): Promise<HandoffRecord> {

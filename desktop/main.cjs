@@ -1,5 +1,5 @@
 // ACB 桌面壳（Electron）：进程内启动 API 服务，窗口加载同源页面
-const { app, BrowserWindow, Menu, dialog, ipcMain } = require("electron");
+const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
 const path = require("node:path");
 const fs = require("node:fs");
 
@@ -69,13 +69,11 @@ ipcMain.handle("acb:pick-folder", async () => {
   return r.canceled || r.filePaths.length === 0 ? null : r.filePaths[0];
 });
 
-ipcMain.handle("acb:pick-archive", async () => {
-  const r = await dialog.showOpenDialog(win, {
-    title: "选择 ACB 交接文件",
-    properties: ["openFile"],
-    filters: [{ name: "ACB 交接包", extensions: ["gz"] }, { name: "所有文件", extensions: ["*"] }],
-  });
-  return r.canceled || r.filePaths.length === 0 ? null : r.filePaths[0];
+// 用系统默认程序打开交接简报 / 包目录：把"去命令行里 cd 过去 cat 一下"这类收尾动作变成一个按钮
+ipcMain.handle("acb:open-path", async (_e, p) => {
+  if (typeof p !== "string" || !p.trim()) return "路径为空，未打开";
+  const result = await shell.openPath(p.trim());
+  return result || "ok";
 });
 
 // 自绘标题栏的窗口三键（close 走系统关闭流程，与标题栏 X 行为一致）

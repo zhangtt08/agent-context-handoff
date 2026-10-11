@@ -75,7 +75,7 @@ export async function hashObject(cwd: string, file: string): Promise<string> {
  * 解 git 的 C-style 引用路径。core.quotePath 默认开启时，非 ASCII 路径在
  * ls-files / ls-tree 的普通输出里是 "\344\270\255\346\226\207.md" 这样的八进制串，
  * 拿它去拼 path.join 或 isSafeRelPath 判定，结果是这台机器上根本不存在的路径 ——
- * 跨机还原时基线里的中文名文件会被静默丢掉而回执一片绿。
+ * 异目录还原时基线里的中文名文件会被静默丢掉而回执一片绿。
  * 带 -z 的输出不会引用路径（NUL 分隔、原样 UTF-8），这里的解码只作为兜底。
  */
 export function unquoteGitPath(raw: string): string {
@@ -175,8 +175,34 @@ export function exclusionInfo(relPath: string): { reason: string; kind: ExcludeR
   return hit ? { reason: hit.reason, kind: hit.kind } : null;
 }
 
-/** 看起来像凭据（用于提示"已提交在历史里"的漏网文件） */
-export function looksLikeSecret(relPath: string): boolean {
+/** 目录型规则：命中一堆文件时收成一条，避免"排除清单比改动清单还长"把关键项（如 .env）埋掉 */
+const DIR_SCOPED_EXCLUDES = new Set(["node_modules/", "dist/", "build/", ".acb/", ".git/", "out/", "target/"]);
+
+/**
+ * 按目录规则折叠排除项：`.acb/store/...` 命中 9 个 → 一条 `.acb/（本次命中 9 个文件）`。
+ * 文件型规则（.env*、*.log、私钥等）逐条保留 —— 接手方要按它们补东西，不能被折叠掉。
+ */
+export function collapseExcluded(
+  list: { path: string; reason: string; kind: ExcludeReason }[],
+): { path: string; reason: string; kind: ExcludeReason }[] {
+  const out: { path: string; reason: string; kind: ExcludeReason; n: number }[] = [];
+  for (const e of list) {
+    const hit = EXCLUSION_REASONS.find((x) => x.re.test(e.path));
+    if (hit && DIR_SCOPED_EXCLUDES.has(hit.label)) {
+      const g = out.find((o) => o.path === hit.label);
+      if (g) { g.n++; continue; }
+      out.push({ path: hit.label, reason: hit.reason, kind: hit.kind, n: 1 });
+      continue;
+    }
+    out.push({ path: e.path, reason: e.reason, kind: e.kind, n: 1 });
+  }
+  return out.map((o) => ({
+    path: o.path, kind: o.kind,
+    reason: o.n > 1 ? `${o.reason}（本次命中 ${o.n} 个文件）` : o.reason,
+  }));
+}
+
+/** 看起来像凭据（用于提示"已提交在历史里"的漏网文件） */export function looksLikeSecret(relPath: string): boolean {
   return EXCLUSION_REASONS.filter((x) => x.kind === "凭据").some((x) => x.re.test(relPath));
 }
 
@@ -234,7 +260,7 @@ const WIN_RESERVED = /^(?:con|prn|aux|nul|com[0-9]|lpt[0-9])(?:\..*)?$/i;
 /**
  * 路径在 Windows 上的形态问题（不是安全判定，别和 isSafeRelPath 混起来）：
  * 保留设备名、以点或空格结尾的段。Node 走 \\?\ 前缀能把它们写出来，
- * 但资源管理器与多数命令行工具看不见或打不开 —— 跨机还原时必须说出来而不是默默落地。
+ * 但资源管理器与多数命令行工具看不见或打不开 —— 异目录还原时必须说出来而不是默默落地。
  */
 export function windowsNameIssues(relPath: string): string[] {
   const out: string[] = [];
