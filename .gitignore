@@ -42,3 +42,5 @@ agent/.endpoint
 
 # ---- Windows 快捷方式（本机桌面产物，不进仓库）----
 *.lnk
+
+*.exe
